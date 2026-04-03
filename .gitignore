@@ -12,7 +12,6 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-companion_app/
 stasys.db
 
 # Development docs (not for release)

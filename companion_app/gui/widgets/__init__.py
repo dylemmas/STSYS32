@@ -1,0 +1,1 @@
+"""STASYS GUI widgets package."""

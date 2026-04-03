@@ -1,0 +1,571 @@
+"""LIVE tab — real-time trace plot and steadiness stats."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import pyqtgraph as pg
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QColor, QPen
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from gui.main_window import DataRouter, MainWindow
+from gui.theme import (
+    BG2,
+    FG_DIM,
+    ORANGE,
+)
+from gui.widgets.score_gauge import ScoreGauge
+from stasys.protocol.packets import DataRawSample, EvtShotDetected
+
+
+class LiveTab(QWidget):
+    """Live monitoring tab with real-time trace and stats."""
+
+    TRAIL_LENGTH = 150            # ~1.5s at 100Hz
+    TRAIL_SEGMENTS = 10           # number of fading segments
+    WOBBLE_WINDOW = 20            # samples for RMS calculation
+
+    def __init__(self, router: DataRouter, main_window: MainWindow) -> None:
+        super().__init__()
+        self._router = router
+        self._mw = main_window
+
+        # Trace state (protected by GIL since only main thread writes)
+        self._angle_x = 0.0
+        self._angle_y = 0.0
+        self.current_angle_x = 0.0
+        self.current_angle_y = 0.0
+        self._trace_x: deque[float] = deque(maxlen=self.TRAIL_LENGTH)
+        self._trace_y: deque[float] = deque(maxlen=self.TRAIL_LENGTH)
+        self._timestamps: deque[float] = deque(maxlen=self.TRAIL_LENGTH)
+
+        # Gyro bias: captured on first sample / re-zero
+        self._gyro_bias_x = 0.0
+        self._gyro_bias_y = 0.0
+        self._bias_captured = False
+
+        # Previous timestamp for dt calculation
+        self._prev_timestamp_us: int | None = None
+
+        # Steadiness state
+        self._hold_time = 0.0
+        self._wobble_rms = 0.0
+        self._npa_deviation = 0.0
+        self._wobble_window: deque[float] = deque(maxlen=self.WOBBLE_WINDOW)
+        self._is_stable = True
+        self._last_stable_check = 0.0
+        self._hold_start_time: float = 0.0
+        self._stable_since: float = 0.0
+        self._jerk_mag = 0.0
+        self._phase = "—"
+
+        # Score
+        self._last_score = 0.0
+        self._last_displacement = 0.0
+        self._last_recoil_text = "—"
+
+        self._build_ui()
+        self._connect_signals()
+
+        # Update timer (GUI refresh) — 16ms = ~60 fps for smooth dot tracking
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._update_ui)
+        self._timer.start(16)  # 60 Hz UI refresh
+
+        # Frame counter: throttle trace redraw to every 3rd frame to avoid
+        # expensive full-history setData() calls on every render tick.
+        # Dot position still updates every frame for sub-16ms cursor feel.
+        self._trace_frame_counter = 0
+
+    # ── UI Construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: trace plot
+        self._plot_widget = self._build_trace_plot()
+        splitter.addWidget(self._plot_widget)
+
+        # Right: stats panel
+        right_panel = self._build_stats_panel()
+        splitter.addWidget(right_panel)
+
+        splitter.setSizes([int(self.width() * 0.65), int(self.width() * 0.35)])
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(splitter)
+
+    def _build_trace_plot(self) -> QWidget:
+        container = QWidget()
+        vlayout = QVBoxLayout(container)
+        vlayout.setContentsMargins(0, 0, 0, 0)
+        vlayout.setSpacing(4)
+
+        # Header
+        header = QWidget()
+        hlayout = QHBoxLayout(header)
+        hlayout.setContentsMargins(4, 4, 4, 0)
+        title = QLabel("REAL-TIME TRACE")
+        title.setStyleSheet(
+            "color: #888; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 10px; letter-spacing: 2px; background: transparent;"
+        )
+        hlayout.addWidget(title)
+
+        self._uncalibrated_badge = QLabel("UNCALIBRATED")
+        self._uncalibrated_badge.setStyleSheet(
+            "background: #3a2a1a; color: #ff6600; padding: 2px 8px; "
+            "border-radius: 3px; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 9px; letter-spacing: 1px;"
+        )
+        hlayout.addWidget(self._uncalibrated_badge)
+        hlayout.addStretch()
+
+        # Coordinate readout
+        self._coord_label = QLabel("X: 0.00°  Y: 0.00°")
+        self._coord_label.setStyleSheet(
+            "color: #555; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 9px; background: transparent;"
+        )
+        hlayout.addWidget(self._coord_label)
+        vlayout.addWidget(header)
+
+        # pyqtgraph plot
+        self._pw = pg.PlotWidget(
+            title="",
+            background="#0d0d0d",
+            foreground="#e0e0e0",
+        )
+        self._pw.setLabel("bottom", "degrees", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
+        self._pw.setLabel("left", "degrees", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
+        self._pw.showGrid(x=True, y=True, alpha=0.15)
+        # Fixed view range — no auto-range, no camera-following.
+        # Trace stays within ±4° window.
+        self._pw.setXRange(-4, 4, padding=0)
+        self._pw.setYRange(-4, 4, padding=0)
+        self._pw.setAspectLocked(True)
+        self._pw.enableAutoRange(False)
+
+        # Crosshair at origin (finite lines through center)
+        self._pw.plot([-10, 10], [0, 0], pen=QPen(QColor(FG_DIM), 0.5))
+        self._pw.plot([0, 0], [-10, 10], pen=QPen(QColor(FG_DIM), 0.5))
+
+        # Fading trail: 10 segments, alpha increases from tail to head.
+        # Each segment is a separate curve so pyqtgraph can render them
+        # with individual alpha without compositing issues.
+        self._trail_curves: list = []
+        for i in range(self.TRAIL_SEGMENTS):
+            # Segment 0 = oldest (most transparent), SEGMENTS-1 = newest (most opaque)
+            alpha = int(255 * (i + 1) / self.TRAIL_SEGMENTS)
+            curve = self._pw.plot(
+                [],
+                [],
+                pen=pg.mkPen(color=(0, 255, 136, alpha), width=1.5),
+                antialias=True,
+            )
+            self._trail_curves.append(curve)
+
+        # Current position dot — solid filled circle, bright green
+        self._dot = pg.ScatterPlotItem(
+            size=7,
+            pen=pg.mkPen(None),
+            brush=pg.mkBrush(0, 255, 136, 255),
+            pxMode=True,
+        )
+        self._pw.addItem(self._dot)
+        self._dot.setData([0.0], [0.0])  # start at origin
+
+        vlayout.addWidget(self._pw, 1)
+        return container
+
+    def _build_stats_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setStyleSheet(f"background: {BG2}; border-radius: 4px;")
+        vlayout = QVBoxLayout(panel)
+        vlayout.setContentsMargins(12, 12, 12, 12)
+        vlayout.setSpacing(16)
+
+        # ── STEADINESS ───────────────────────────────────────────────────────
+        vlayout.addWidget(self._section_label("STEADINESS"))
+
+        # Hold indicator dot + HOLD STEADY label
+        steadiness_header = QWidget()
+        sh_layout = QHBoxLayout(steadiness_header)
+        sh_layout.setContentsMargins(0, 0, 0, 0)
+        self._hold_indicator = QLabel()
+        self._hold_indicator.setFixedSize(12, 12)
+        self._hold_indicator.setStyleSheet(
+            "background: #00ff88; border-radius: 6px;"
+        )
+        sh_layout.addWidget(self._hold_indicator)
+        sh_layout.addWidget(QLabel("HOLD STEADY"))
+        sh_layout.addStretch()
+        steadiness_header.setStyleSheet(
+            "font-family: 'JetBrains Mono', monospace; font-size: 10px; "
+            "color: #888; letter-spacing: 1px; background: transparent;"
+        )
+        vlayout.addWidget(steadiness_header)
+
+        # Progress bar
+        self._steadiness_bar = QProgressBar()
+        self._steadiness_bar.setRange(0, 100)
+        self._steadiness_bar.setValue(100)
+        self._steadiness_bar.setFormat("")
+        vlayout.addWidget(self._steadiness_bar)
+
+        # Hold / Wobble / NPA row
+        grid = self._build_stat_grid()
+        vlayout.addLayout(grid)
+
+        vlayout.addSpacing(8)
+
+        # ── LAST SCORE ───────────────────────────────────────────────────────
+        vlayout.addWidget(self._section_label("LAST SCORE"))
+
+        score_row = QWidget()
+        sr_layout = QHBoxLayout(score_row)
+        sr_layout.setContentsMargins(0, 4, 0, 4)
+        self._score_gauge = ScoreGauge()
+        sr_layout.addWidget(self._score_gauge)
+        sr_layout.addStretch()
+        vlayout.addWidget(score_row)
+
+        vlayout.addSpacing(8)
+
+        # ── LAST DIRECTION ───────────────────────────────────────────────────
+        vlayout.addWidget(self._section_label("LAST DIRECTION"))
+
+        self._direction_bar = QLabel("— No shot yet —")
+        self._direction_bar.setStyleSheet(
+            "background: #1a1a1a; border: 1px solid #333; border-radius: 4px; "
+            "padding: 10px; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 12px; color: #888; text-align: center;"
+        )
+        vlayout.addWidget(self._direction_bar)
+
+        vlayout.addSpacing(8)
+
+        # ── DEVICE STATUS ────────────────────────────────────────────────────
+        vlayout.addWidget(self._section_label("DEVICE STATUS"))
+
+        status_grid = QHBoxLayout()
+        status_grid.setSpacing(16)
+
+        jer_l = QVBoxLayout()
+        jer_l.setSpacing(2)
+        jer_l.addWidget(QLabel("JERK"))
+        self._jerk_val = QLabel("—")
+        self._jerk_val.setObjectName("value_accent")
+        self._jerk_val.setStyleSheet(
+            "color: #00ff88; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 14px; font-weight: bold; background: transparent;"
+        )
+        jer_l.addWidget(self._jerk_val)
+        status_grid.addLayout(jer_l)
+
+        phase_l = QVBoxLayout()
+        phase_l.setSpacing(2)
+        phase_l.addWidget(QLabel("PHASE"))
+        self._phase_val = QLabel("—")
+        self._phase_val.setStyleSheet(
+            "color: #888; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 14px; font-weight: bold; background: transparent;"
+        )
+        phase_l.addWidget(self._phase_val)
+        status_grid.addLayout(phase_l)
+
+        vlayout.addLayout(status_grid)
+
+        vlayout.addStretch()
+        return panel
+
+    def _build_stat_grid(self) -> QHBoxLayout:
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+
+        for label, value_id in [
+            ("HOLD", "hold_val"),
+            ("WOBBLE", "wobble_val"),
+            ("NPA", "npa_val"),
+        ]:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                "color: #555; font-family: 'JetBrains Mono', monospace; "
+                "font-size: 9px; letter-spacing: 1px; background: transparent;"
+            )
+            val = QLabel("—")
+            val.setObjectName(value_id)
+            val.setStyleSheet(
+                "color: #e0e0e0; font-family: 'JetBrains Mono', monospace; "
+                "font-size: 14px; font-weight: bold; background: transparent;"
+            )
+            setattr(self, f"_{value_id}", val)
+            col.addWidget(lbl)
+            col.addWidget(val)
+            grid.addLayout(col)
+
+        return grid
+
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color: #555; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 9px; letter-spacing: 2px; text-transform: uppercase; "
+            "padding-bottom: 4px; border-bottom: 1px solid #222; "
+            "background: transparent;"
+        )
+        return lbl
+
+    # ── Signal connections ────────────────────────────────────────────────────
+
+    def _connect_signals(self) -> None:
+        self._router.sample_received.connect(self._on_sample)
+        self._router.shot_received.connect(self._on_shot)
+
+    # ── Packet handlers ───────────────────────────────────────────────────────
+
+    def _on_sample(self, sample: DataRawSample) -> None:
+        """Process a raw IMU sample — called on main thread via signal."""
+        # Session start / wrap-around: reset integration state
+        if sample.sample_counter == 0:
+            self._prev_timestamp_us = None
+            self._bias_captured = False
+            self._trace_x.clear()
+            self._trace_y.clear()
+            self._timestamps.clear()
+            self._wobble_window.clear()
+            self._angle_x = 0.0
+            self._angle_y = 0.0
+            self._hold_start_time = 0.0
+            self._stable_since = 0.0
+
+        # Compute dt from actual firmware timestamp (must be in SECONDS)
+        if self._prev_timestamp_us is not None:
+            dt = (sample.timestamp_us - self._prev_timestamp_us) / 1_000_000.0
+            # Clamp: ignore gaps > 50ms (e.g. after missed packets)
+            dt = min(dt, 0.05)
+        else:
+            dt = 0.01  # seed dt on first sample
+        self._prev_timestamp_us = sample.timestamp_us
+
+        gyro_x_dps = sample.gyro_x / 65.5
+        gyro_y_dps = sample.gyro_y / 65.5
+
+        # Capture gyro bias on first sample — raw gyro zero-drift causes huge
+        # angle drift if uncorrected. Bias is re-captured on re-zero.
+        if not self._bias_captured:
+            self._gyro_bias_x = gyro_x_dps
+            self._gyro_bias_y = gyro_y_dps
+            self._bias_captured = True
+
+        # Integrate gyro with bias correction
+        self._angle_x += (gyro_x_dps - self._gyro_bias_x) * dt
+        self._angle_y += (gyro_y_dps - self._gyro_bias_y) * dt
+
+        # Apply zero offset (RE-ZERO baseline)
+        offset_x, offset_y = self._mw.get_zero_offset()
+        disp_x = self._angle_x - offset_x
+        disp_y = self._angle_y - offset_y
+
+        self.current_angle_x = self._angle_x
+        self.current_angle_y = self._angle_y
+
+        # Store for fading trail
+        self._trace_x.append(disp_x)
+        self._trace_y.append(disp_y)
+        self._timestamps.append(sample.timestamp_us / 1_000_000.0)
+
+        # Compute jerk magnitude
+        accel_x = sample.accel_x / 8192.0 * 9.81
+        jerk_x = accel_x / dt if dt > 0 else 0
+        self._jerk_mag = abs(jerk_x)
+
+        # Steadiness metrics (bias-corrected gyro for wobble)
+        gyro_mag = ((gyro_x_dps - self._gyro_bias_x) ** 2 +
+                    (gyro_y_dps - self._gyro_bias_y) ** 2) ** 0.5
+        self._wobble_window.append(gyro_mag)
+        self._wobble_rms = (
+            sum(v ** 2 for v in self._wobble_window) / len(self._wobble_window)
+        ) ** 0.5
+        self._npa_deviation = (disp_x ** 2 + disp_y ** 2) ** 0.5
+
+        # Phase detection
+        jerk_threshold = self._mw.get_settings().get("jerk_threshold", 5.0) * 9.81
+        if sample.piezo > 200:  # Piezo activity → recoil
+            self._phase = "Recoil"
+        elif abs(jerk_x) > jerk_threshold:
+            self._phase = "Press"
+        else:
+            self._phase = "Hold"
+
+        # Stability
+        self._is_stable = self._wobble_rms < 2.0  # deg/s threshold
+        if self._is_stable:
+            if self._stable_since == 0.0:
+                self._stable_since = self._timestamps[-1]
+            self._hold_time = self._timestamps[-1] - self._stable_since
+        else:
+            self._stable_since = 0.0
+
+    def _on_shot(self, shot: EvtShotDetected) -> None:
+        """Called when a shot is detected."""
+        gyro_x = shot.gyro_x_peak / 65.5
+        gyro_y = shot.gyro_y_peak / 65.5
+        displacement = (gyro_x ** 2 + gyro_y ** 2) ** 0.5
+        base_score = max(0.0, 100.0 - (displacement / 5.0) * 100.0)
+        self._last_score = min(100.0, base_score)
+        self._last_displacement = displacement
+
+        # Direction
+        axis = shot.recoil_axis
+        sign = shot.recoil_sign
+        parts = []
+        if axis == 0:
+            parts.append("RIGHT" if sign > 0 else "LEFT")
+        elif axis == 1:
+            parts.append("DOWN" if sign > 0 else "UP")
+        if gyro_x > 1 or gyro_y > 1:
+            parts.append("HIGH")
+        elif gyro_x > 0.5 or gyro_y > 0.5:
+            parts.append("MED")
+        self._last_recoil_text = "—".join(parts) if parts else "CENTER"
+        if not parts:
+            self._last_recoil_text = "CENTER"
+
+        self._score_gauge.set_score(self._last_score)
+
+    def _update_ui(self) -> None:
+        """Called on timer — update plot and stats (always on main thread)."""
+        # Current dot position
+        dot_x = self.current_angle_x
+        dot_y = self.current_angle_y
+
+        # Update dot every frame for sub-16ms cursor feel
+        self._dot.setData([dot_x], [dot_y])
+
+        # Coordinate readout
+        self._coord_label.setText(f"X: {dot_x:+.2f}°  Y: {dot_y:+.2f}°")
+
+        # Update trail segments every 3rd frame (dot is every frame).
+        # Split the trail into TRAIL_SEGMENTS slices; oldest = most transparent.
+        self._trace_frame_counter += 1
+        if self._trace_frame_counter >= 3 and self._trace_x and self._trace_y:
+            self._trace_frame_counter = 0
+            xs = list(self._trace_x)
+            ys = list(self._trace_y)
+            n = len(xs)
+            segs = self.TRAIL_SEGMENTS
+            for i, curve in enumerate(self._trail_curves):
+                start = int(n * i / segs)
+                end = int(n * (i + 1) / segs)
+                if end > start:
+                    curve.setData(xs[start:end], ys[start:end])
+                else:
+                    curve.setData([], [])
+
+        # Update steadiness
+        wobble_pct = max(0, min(100, int(100 - self._wobble_rms * 20)))
+        self._steadiness_bar.setValue(wobble_pct)
+        bar_color = "#00ff88" if wobble_pct > 60 else "#ff6600" if wobble_pct > 30 else "#ff3333"
+        self._steadiness_bar.setStyleSheet(
+            f"QProgressBar {{ background: #222; border: none; border-radius: 3px; height: 8px; }}"
+            f"QProgressBar::chunk {{ background: {bar_color}; border-radius: 3px; }}"
+        )
+
+        self._hold_val.setStyleSheet(
+            f"color: #e0e0e0; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 14px; font-weight: bold; background: transparent;"
+        )
+        self._hold_val.setText(f"{self._hold_time:.1f}s")
+
+        self._wobble_val.setText(f"{self._wobble_rms:.1f}°/s")
+        wobble_color = "#00ff88" if self._wobble_rms < 1.5 else "#ff6600" if self._wobble_rms < 3.0 else "#ff3333"
+        self._wobble_val.setStyleSheet(
+            f"color: {wobble_color}; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 14px; font-weight: bold; background: transparent;"
+        )
+
+        self._npa_val.setText(f"{self._npa_deviation:.2f}°")
+        npa_color = "#00ff88" if self._npa_deviation < 0.5 else "#ff6600" if self._npa_deviation < 2.0 else "#ff3333"
+        self._npa_val.setStyleSheet(
+            f"color: {npa_color}; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 14px; font-weight: bold; background: transparent;"
+        )
+
+        # Hold indicator
+        if self._is_stable:
+            self._hold_indicator.setStyleSheet("background: #00ff88; border-radius: 6px;")
+        else:
+            self._hold_indicator.setStyleSheet("background: #ff3333; border-radius: 6px;")
+
+        # Device status
+        self._jerk_val.setText(f"{self._jerk_mag:.1f}")
+        self._phase_val.setText(self._phase)
+        phase_color = {"Hold": "#00ff88", "Press": "#ff6600", "Recoil": "#ff3333"}.get(self._phase, "#888")
+        self._phase_val.setStyleSheet(
+            f"color: {phase_color}; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 14px; font-weight: bold; background: transparent;"
+        )
+
+        # Direction
+        self._direction_bar.setText(self._last_recoil_text)
+        self._direction_bar.setStyleSheet(
+            "background: #1a1a1a; border: 1px solid #333; border-radius: 4px; "
+            "padding: 10px; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 14px; color: {ORANGE}; text-align: center; font-weight: bold;"
+        )
+
+        # Uncalibrated badge
+        if self._mw.is_zero_set():
+            self._uncalibrated_badge.hide()
+        else:
+            self._uncalibrated_badge.show()
+
+    def on_disconnect(self) -> None:
+        """Clear all live data."""
+        self._trace_x.clear()
+        self._trace_y.clear()
+        self._timestamps.clear()
+        for curve in self._trail_curves:
+            curve.setData([], [])
+        self._dot.setData([0.0], [0.0])
+        self._angle_x = 0.0
+        self._angle_y = 0.0
+        self.current_angle_x = 0.0
+        self.current_angle_y = 0.0
+        self._prev_timestamp_us = None
+        self._bias_captured = False
+        self._hold_time = 0.0
+        self._wobble_rms = 0.0
+        self._npa_deviation = 0.0
+        self._wobble_window.clear()
+        self._jerk_mag = 0.0
+        self._phase = "—"
+        self._trace_frame_counter = 0
+
+    def on_rezero(self) -> None:
+        """Reset zero baseline and clear trail."""
+        self._angle_x = 0.0
+        self._angle_y = 0.0
+        self._trace_x.clear()
+        self._trace_y.clear()
+        self._timestamps.clear()
+        for curve in self._trail_curves:
+            curve.setData([], [])
+        self._dot.setData([0.0], [0.0])
+        self._hold_time = 0.0
+        self._stable_since = 0.0
+        # Re-capture gyro bias so integration resets cleanly
+        self._bias_captured = False
+        self._prev_timestamp_us = None

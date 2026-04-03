@@ -248,10 +248,10 @@ static void feedInnerDecoder(const uint8_t* data, uint16_t len) {
                 break;
             case DecoderState::READ_LEN_HI: {
                 s_innerDecoder.payloadLen |= ((uint16_t)byte << 8);
-                // Accumulate CRC: feed LEN_HI byte incrementally
+                // Accumulate CRC: continue from accumulated TYPE + LEN_LO CRC
                 {
                     uint8_t hi = byte;
-                    uint16_t crc = s_innerDecoder.crcComputed;
+                    uint16_t crc = s_innerDecoder.crcComputed;  // start from accumulated
                     crc ^= ((uint16_t)hi << 8);
                     for (uint8_t j = 0; j < 8; j++) {
                         crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
@@ -356,12 +356,17 @@ bool decodeByte(uint8_t byte, DecodedPacket* outPkt) {
             g_decoder.state = DecoderState::READ_LEN_HI;
             break;
 
-        case DecoderState::READ_LEN_HI:
+        case DecoderState::READ_LEN_HI: {
             g_decoder.payloadLen |= ((uint16_t)byte << 8);
-            // Accumulate CRC: feed LEN_HI byte (not the full payloadLen)
+            // Accumulate CRC: continue from accumulated TYPE + LEN_LO CRC
             {
                 uint8_t hi = byte;
-                g_decoder.crcComputed = crc16_ccitt(&hi, 1);
+                uint16_t crc = g_decoder.crcComputed;  // start from accumulated
+                crc ^= ((uint16_t)hi << 8);
+                for (uint8_t j = 0; j < 8; j++) {
+                    crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
+                }
+                g_decoder.crcComputed = crc;
             }
             if (g_decoder.payloadLen > MAX_PACKET_SIZE) {
                 g_decoder.state = DecoderState::WAIT_SYNC0;
@@ -383,6 +388,7 @@ bool decodeByte(uint8_t byte, DecodedPacket* outPkt) {
             } else {
                 g_decoder.state = DecoderState::READ_PAYLOAD;
             }
+            }  // end READ_LEN_HI
             break;
 
         case DecoderState::READ_PAYLOAD:
