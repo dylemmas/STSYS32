@@ -1,5 +1,16 @@
 # CLAUDE.md — STASYS ESP32 Firmware
 
+## Git Workflow
+
+**Repository**: https://github.com/dylemmas/STSYS32
+
+After every edit, commit the changes and push to GitHub:
+```
+git add <changed files>
+git commit -m "<description>"
+git push origin main
+```
+
 ## Project Overview
 
 STASYS is a shooting athlete training device that captures muzzle trace movement and shot events via an ESP32 + MPU6050 + Piezoelectric sensor system. This directory contains the ESP32 firmware. The companion Python app lives in `companion_app/`.
