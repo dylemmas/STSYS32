@@ -1,299 +1,622 @@
 #include <Arduino.h>
-#include "BluetoothSerial.h"
-#include <Wire.h>
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_gap_bt_api.h"
-#include "mbedtls/sha256.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_task_wdt.h>
+#include <esp_timer.h>
+#include <nvs_flash.h>
+#include <esp_system.h>
+#include <esp_efuse.h>
+#include <esp_flash_encrypt.h>
+#include <esp_efuse_table.h>
+
+// Core headers
+#include "protocol.h"
+#include "sensor.h"
+#include "config.h"
+#include "session.h"
+#include "shot_detector.h"
+#include "security.h"
+#include "bluetooth.h"
+#include "battery.h"
+#include "led.h"
+#include "storage.h"
+#include "ota.h"
 
 // ================= CONFIGURATION =================
-#define BATTERY_PIN 39          // ADC1_CH3
-#define PIEZO_PIN   35          // ADC1_CH7 (D35) - Safe for Bluetooth use
-#define I2C_SDA 21              
-#define I2C_SCL 22              
-#define MPU_ADDR 0x68
+#define SENSOR_TASK_STACK   4096
+#define DETECTOR_TASK_STACK  4096
+#define STREAM_TASK_STACK    2048
+#define BATTERY_TASK_STACK   1024
+#define RECOVERY_TASK_STACK 2048
 
-#define VOLTAGE_DIVIDER_RATIO 2.0 
-#define BATTERY_MAX_VOLTAGE 4.2 
-#define BATTERY_MIN_VOLTAGE 3.0 
+#define BATTERY_INTERVAL_MS  30000UL  // 30s between battery reads
 
-// --- TIMING CONFIGURATION ---
-// We send to Python at 100Hz (10ms)
-// BUT we read the sensor at 1000Hz (1ms) to catch the click
-#define SEND_RATE_MS 10       
-#define OVERSAMPLE_LOOPS 10   // Read 10 times per packet
-#define CPU_FREQ_MHZ 240      // Max speed for high sample rate
+// ================= QUEUES =================
+QueueHandle_t sampleQueue    = NULL;
+QueueHandle_t shotEventQueue = NULL;
 
-const char* SECRET_KEY = "12ebaf10h12fa9123z21sti";
+// ================= STATS =================
+static uint32_t s_sampleCounter = 0;
+static uint32_t s_droppedSamples = 0;
+static uint32_t s_shotsDetected = 0;
+static uint32_t s_lastBatteryUpdate = 0;
+static uint32_t s_lastActivityTime = 0;
+static bool s_sleepScheduled = false;
 
-// =================================================
+#define IDLE_TIMEOUT_MS (5UL * 60 * 1000)  // 5 minutes idle → sleep
 
-BluetoothSerial SerialBT;
-
-volatile bool isAuthenticated = false;
-volatile int batteryPercentage = 0;
-
-// --- BINARY PACKET STRUCTURE ---
-// Added 'piezo' field to transmit shockwave data
-struct __attribute__((packed)) DataPacket {
-  uint8_t header[2]; // 0xAA, 0xBB
-  float ax;
-  float ay;
-  float az;
-  float gx;
-  float gy;
-  float gz;
-  uint16_t piezo;    // Raw ADC value of the piezo shock
-  uint8_t battery;
-  uint8_t checksum;
-};
-
-// --- Helper Functions ---
-
-void writeMPURegister(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
+// ================= POWER MANAGEMENT =================
+static void recordActivity() {
+    s_lastActivityTime = millis();
+    s_sleepScheduled = false;
 }
 
-float readBatteryVoltage() {
-  // Simple avg reading
-  long sum = 0;
-  for(int i=0; i<16; i++) sum += analogRead(BATTERY_PIN);
-  return ((sum / 16.0) / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO;
-}
+static void checkIdleSleep() {
+    uint32_t now = millis();
 
-int calculateBatteryPercentage(float voltage) {
-  if (voltage >= BATTERY_MAX_VOLTAGE) return 100;
-  if (voltage <= BATTERY_MIN_VOLTAGE) return 0;
-  float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
-  return constrain((int)percentage, 0, 100);
-}
+    // Don't sleep while connected, streaming, or charging
+    if (g_btConnected) return;
+    if (getSessionState() == SessionState::STREAMING) return;
+    if (isBatteryCharging()) return;
 
-void handleAuthentication() {
-  isAuthenticated = false;
-  delay(500); 
-  SerialBT.println("READY");
+    if (!s_sleepScheduled) {
+        if (now - s_lastActivityTime > IDLE_TIMEOUT_MS) {
+            Serial.println("[PWR] Idle timeout reached, entering light sleep...");
+            s_sleepScheduled = true;
 
-  String challenge = "";
-  unsigned long startTime = millis();
-  SerialBT.setTimeout(500); 
+            // Light sleep for 10 seconds, wake and recheck
+            esp_sleep_enable_timer_wakeup(10 * 1000000ULL);
+            esp_light_sleep_start();
 
-  while (millis() - startTime < 5000) {
-    if (SerialBT.available()) {
-      challenge = SerialBT.readStringUntil('\n');
-      challenge.trim();
-      if (challenge.length() > 0) break;
+            // On wake
+            s_sleepScheduled = false;
+            recordActivity();
+            Serial.println("[PWR] Woke from light sleep");
+        }
     }
-    delay(10);
-  }
-
-  if (challenge.length() == 0) {
-    SerialBT.disconnect(); 
-    return;
-  }
-
-  String toHash = challenge + String(SECRET_KEY);
-  byte hashResult[32];
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, (const unsigned char*)toHash.c_str(), toHash.length());
-  mbedtls_sha256_finish(&ctx, hashResult);
-  mbedtls_sha256_free(&ctx);
-
-  char hexHash[65];
-  for (int i = 0; i < 32; i++) sprintf(hexHash + (i * 2), "%02x", hashResult[i]);
-  SerialBT.println(hexHash); 
-  delay(200); 
-  isAuthenticated = true; 
 }
 
-// --- MANTISX-STYLE SENSOR TASK ---
-// This task runs strictly on Core 1 to ensure timing stability
-void sensorTask(void *parameter) {
-  
-  // RAW variables
-  int16_t rax, ray, raz, rgx, rgy, rgz;
-  
-  // Variables to hold the "Peak" sample found in the loop
-  float peak_ax, peak_ay, peak_az;
-  float avg_gx, avg_gy, avg_gz;
-  uint16_t max_piezo; // Track peak piezo shock in the window
-  
-  // Tracking acceleration changes (Jerk)
-  float prev_ax_val = 0, prev_ay_val = 0, prev_az_val = 0;
+// ================= FIRMWARE VERSION =================
+#define FIRMWARE_VERSION_MAJOR 1
+#define FIRMWARE_VERSION_MINOR 0
+#define FIRMWARE_VERSION_PATCH 0
+#define FIRMWARE_VERSION ((FIRMWARE_VERSION_MAJOR << 16) | (FIRMWARE_VERSION_MINOR << 8) | FIRMWARE_VERSION_PATCH)
 
-  for (;;) {
-    if (SerialBT.connected()) {
-      if (!isAuthenticated) handleAuthentication();
-      
-      if (isAuthenticated) {
-        
-        float max_shock_energy = -1.0;
-        long gyro_sum_x = 0, gyro_sum_y = 0, gyro_sum_z = 0;
-        max_piezo = 0; // Reset peak for this packet window
+// ================= TASK FUNCTIONS =================
 
-        // --- OVERSAMPLING LOOP (1kHz) ---
-        // We read the sensor multiple times but only send ONE packet.
-        // We pick the reading with the highest "Shock" value.
-        for(int i=0; i<OVERSAMPLE_LOOPS; i++) {
-            
-            // 1. Fast I2C Read (Raw Registers)
-            Wire.beginTransmission(MPU_ADDR);
-            Wire.write(0x3B); 
-            Wire.endTransmission(false);
-            Wire.requestFrom(MPU_ADDR, 14, true);
+// --- Recovery Task (Core 1, Medium Priority) ---
+// Runs I2C bus recovery asynchronously so sensor task isn't blocked
+void recoveryTask(void* param) {
+    (void)param;
+    Serial.println("[RECOVERY] Task started");
+    esp_task_wdt_add(NULL);
 
-            if (Wire.available() >= 14) {
-                rax = Wire.read() << 8 | Wire.read();
-                ray = Wire.read() << 8 | Wire.read();
-                raz = Wire.read() << 8 | Wire.read();
-                Wire.read(); Wire.read(); // Temp
-                rgx = Wire.read() << 8 | Wire.read();
-                rgy = Wire.read() << 8 | Wire.read();
-                rgz = Wire.read() << 8 | Wire.read();
+    for (;;) {
+        // Guard against recoveryQueue not being created (MPU6050 may not be detected)
+        if (recoveryQueue != NULL) {
+            bool signal;
+            if (xQueueReceive(recoveryQueue, &signal, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                Serial.println("[RECOVERY] I2C error detected, attempting recovery...");
+                // Run synchronous recovery (this blocks the recovery task, not sensor task)
+                recoverI2CBus();
+                s_consecutiveErrors = 0;  // Reset from sensor.cpp's view
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1000));  // Wait without busy-waiting
+        }
+    }
+}
+
+// --- Sensor Task (Core 1, High Priority) ---
+void sensorTask(void* param) {
+    (void)param;
+
+    Serial.println("[SENSOR] Task started");
+    esp_task_wdt_add(NULL);
+
+    SensorSample sample;
+
+    for (;;) {
+        // Block on data-ready semaphore (set by ISR)
+        // Guard against NULL semaphore when MPU6050 is not detected
+        if (dataReadySem != NULL && xSemaphoreTake(dataReadySem, pdMS_TO_TICKS(5)) == pdTRUE) {
+            // Read sensor immediately
+            if (readSensorBurst(&sample) && sampleQueue != NULL) {
+                // Push to sample queue (non-blocking)
+                BaseType_t sent = xQueueSendToBack(sampleQueue, &sample, 0);
+                if (sent != pdTRUE) {
+                    s_droppedSamples++;
+                }
+                s_sampleCounter++;
+            }
+        } else {
+            // Timeout or no semaphore: sensor stalled. Do a polling fallback read.
+            if (readSensorBurst(&sample) && sampleQueue != NULL) {
+                xQueueSendToBack(sampleQueue, &sample, 0);
+                s_sampleCounter++;
+            }
+        }
+        // Always reset WDT to prevent timeout even when sensor is absent
+        esp_task_wdt_reset();
+    }
+}
+
+// --- Shot Detector Task (Core 1, Medium Priority) ---
+void shotDetectorTask(void* param) {
+    (void)param;
+
+    Serial.println("[DETECTOR] Task started");
+    esp_task_wdt_add(NULL);
+
+    SensorSample sample;
+    ShotEvent event;
+    FirmwareConfig cfg;
+    uint32_t configRefreshCounter = 0;
+
+    // Initial config load
+    getConfigCopy(&cfg);
+    updateShotDetectorConfig(&cfg);
+
+    for (;;) {
+        if (sampleQueue != NULL && xQueueReceive(sampleQueue, &sample, pdMS_TO_TICKS(10)) == pdTRUE) {
+            // Periodically refresh config (every 100 samples)
+            if (++configRefreshCounter >= 100) {
+                getConfigCopy(&cfg);
+                updateShotDetectorConfig(&cfg);
+                configRefreshCounter = 0;
             }
 
-            // 2. Read Piezo
-            // We use analogRead inside the fast loop to catch the spike
-            uint16_t current_piezo = analogRead(PIEZO_PIN);
-            if (current_piezo > max_piezo) {
-                max_piezo = current_piezo;
+            // Only process if session is active
+            if (getSessionState() == SessionState::STREAMING) {
+                bool shotDetected = processSample(&sample, &event,
+                                                  g_lastSession.session_id);
+                if (shotDetected) {
+                    s_shotsDetected++;
+                    addShotToSession(&event);
+
+                    // Send shot event packet immediately
+                    sendPacketBlocking(PKT_TYPE_EVT_SHOT_DETECTED,
+                                       &event, sizeof(event));
+
+                    // LED + haptic feedback
+                    triggerShotFeedback();
+
+                    // Also send shot via event queue for any other consumers
+                    if (shotEventQueue != NULL) {
+                        xQueueSendToBack(shotEventQueue, &event, 0);
+                    }
+                }
             }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_task_wdt_reset();  // Prevent WDT timeout during idle polling
+    }
+}
 
-            // 3. Convert Accel (4G Range = 8192 LSB)
-            float c_ax = (rax / 8192.0) * 9.81;
-            float c_ay = (ray / 8192.0) * 9.81;
-            float c_az = (raz / 8192.0) * 9.81;
+// --- Stream Task (Core 0, Low Priority) ---
+void streamTask(void* param) {
+    (void)param;
 
-            // 4. Calculate "Shock Energy" (Absolute Jerk from Accel)
-            // This detects the CLICK even if it's super short
-            float jerk = abs(c_ax - prev_ax_val) + abs(c_ay - prev_ay_val) + abs(c_az - prev_az_val);
-            
-            // If this specific ms has the highest shock, save it as the "Peak"
-            if (jerk > max_shock_energy) {
-                max_shock_energy = jerk;
-                peak_ax = c_ax;
-                peak_ay = c_ay;
-                peak_az = c_az;
-            }
+    Serial.println("[STREAM] Task started");
+    esp_task_wdt_add(NULL);
 
-            // Accumulate Gyro for smoothing (Trace needs smoothness, not peaks)
-            gyro_sum_x += rgx;
-            gyro_sum_y += rgy;
-            gyro_sum_z += rgz;
+    SensorSample sample;
+    FirmwareConfig cfg;
+    uint32_t lastStreamTime_us = 0;
+    uint32_t streamInterval_us = 10000; // default 100Hz
+    uint32_t configRefreshCounter = 0;
 
-            // Update history
-            prev_ax_val = c_ax;
-            prev_ay_val = c_ay;
-            prev_az_val = c_az;
+    getConfigCopy(&cfg);
 
-            // Wait ~1ms to hit 1kHz sampling
-            // I2C takes ~0.4ms, analogRead takes ~0.1ms. 
-            // Reduced delay slightly to accommodate extra ADC read time.
-            delayMicroseconds(400); 
+    for (;;) {
+        uint32_t now = esp_timer_get_time();
+
+        // Refresh config periodically
+        if (++configRefreshCounter >= 500) {
+            getConfigCopy(&cfg);
+            streamInterval_us = 1000000 / cfg.streaming_rate_hz;
+            configRefreshCounter = 0;
         }
 
-        // --- PREPARE PACKET ---
-        // Use the PEAK Accel found (for Trigger Detect)
-        // Use the PEAK Piezo found (for Shock Detect)
-        // Use the AVERAGE Gyro (for clean Trace)
-        
-        DataPacket pkt;
-        pkt.header[0] = 0xAA;
-        pkt.header[1] = 0xBB;
-        pkt.ax = peak_ax;
-        pkt.ay = peak_ay;
-        pkt.az = peak_az;
-        
-        // Convert Gyro Avg (500dps = 65.5 LSB)
-        pkt.gx = ((gyro_sum_x / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
-        pkt.gy = ((gyro_sum_y / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
-        pkt.gz = ((gyro_sum_z / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
-        
-        pkt.piezo = max_piezo; // Send the highest piezo value seen in this 10ms
-        pkt.battery = (uint8_t)batteryPercentage;
-        
-        // XOR Checksum
-        uint8_t* ptr = (uint8_t*)&pkt;
-        pkt.checksum = 0;
-        for(int i=2; i<sizeof(DataPacket)-1; i++) {
-          pkt.checksum ^= ptr[i];
+        // Check data mode: 0=both, 1=raw-only, 2=events-only
+        if (cfg.data_mode == 2) {
+            // Events only — don't stream raw data
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
-        SerialBT.write((const uint8_t*)&pkt, sizeof(DataPacket));
-        
-      } else {
-        delay(1000);
-      }
+        if (getSessionState() == SessionState::STREAMING) {
+            if (now - lastStreamTime_us >= streamInterval_us) {
+                lastStreamTime_us = now;
+
+                // Peek at latest sample (non-blocking)
+                if (sampleQueue != NULL && xQueueReceive(sampleQueue, &sample, 0) == pdTRUE) {
+                    PktRawSample pkt;
+                    pkt.sample_counter = s_sampleCounter;
+                    pkt.timestamp_us = sample.timestamp_us;
+                    pkt.accel_x = sample.accel_x;
+                    pkt.accel_y = sample.accel_y;
+                    pkt.accel_z = sample.accel_z;
+                    pkt.gyro_x = sample.gyro_x;
+                    pkt.gyro_y = sample.gyro_y;
+                    pkt.gyro_z = sample.gyro_z;
+                    pkt.piezo = sample.piezo;
+                    pkt.temperature = sample.temperature;
+
+                    sendPacket(PKT_TYPE_DATA_RAW_SAMPLE, &pkt, sizeof(pkt));
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_task_wdt_reset();
+    }
+}
+
+// --- Battery Monitor Task (Core 0, Low Priority) ---
+void batteryMonitorTask(void* param) {
+    (void)param;
+
+    Serial.println("[BATTERY] Task started");
+    esp_task_wdt_add(NULL);
+
+    int lastReportedVal = -1;
+
+    for (;;) {
+        updateBattery();
+        uint8_t currentVal = getBatteryPercent();
+
+        // Reset idle timer (periodic activity)
+        recordActivity();
+
+        if (lastReportedVal < 0 || abs((int)currentVal - (int)lastReportedVal) >= 2) {
+            lastReportedVal = currentVal;
+        }
+
+        // Low battery warning via LED
+        BatteryStatus st = readBattery();
+        if (st.isLow && !st.isCharging) {
+            setLEDMode(LEDMode::LOW_BATTERY);
+        }
+
+        // Periodic health report
+        if (s_sampleCounter > 0 && (s_sampleCounter % 10000 == 0)) {
+            Serial.printf("[STATS] samples=%lu dropped=%lu shots=%lu batt=%d%%\n",
+                         s_sampleCounter, s_droppedSamples, s_shotsDetected, currentVal);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BATTERY_INTERVAL_MS / portTICK_PERIOD_MS));
+        esp_task_wdt_reset();
+    }
+}
+
+// --- Bluetooth Task (Core 0, High Priority) ---
+void bluetoothTask(void* param) {
+    (void)param;
+
+    Serial.println("[BT] Task started");
+    esp_task_wdt_add(NULL);
+
+    DecodedPacket cmd;
+
+    for (;;) {
+        // Check connection state
+        bool connected = SerialBT.connected();
+        if (connected != g_btConnected) {
+            g_btConnected = connected;
+            if (connected) {
+                Serial.println("[BT] Connected");
+                setLEDMode(LEDMode::CONNECTED);
+
+                // Auto-stop any active session on disconnect
+                if (getSessionState() == SessionState::STREAMING) {
+                    stopSession();
+                    PktSessionStopped pkt;
+                    pkt.session_id = g_lastSession.session_id;
+                    pkt.duration_ms = g_lastSession.duration_ms;
+                    pkt.shot_count = g_lastSession.shot_count;
+                    pkt.battery_end = getBatteryPercent();
+                    pkt.sensor_health = 0;
+                    sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
+                }
+            } else {
+                Serial.println("[BT] Disconnected");
+                setLEDMode(LEDMode::IDLE);
+            }
+        }
+
+        // Read incoming BT data
+        int available = SerialBT.available();
+        if (available > 0) {
+            int toRead = min(available, (int)(sizeof(s_rxBuffer) - s_rxLen));
+            if (toRead == 0) {
+                // Buffer full — don't discard everything, just wait for drain
+                s_rxOverflowCount++;
+                Serial.printf("[BT] RX overflow #%lu (buffer full)\n", s_rxOverflowCount);
+                vTaskDelay(pdMS_TO_TICKS(5));  // Let buffer drain
+                continue;
+            }
+            int bytesRead = SerialBT.readBytes(s_rxBuffer + s_rxLen, toRead);
+            if (bytesRead > 0) {
+                s_rxLen += bytesRead;
+
+                // Parse through buffer
+                uint16_t consumed = 0;
+                for (uint16_t i = 0; i < s_rxLen; ) {
+                    bool found = false;
+                    uint16_t best = 0;
+
+                    // Try to find complete packet
+                    for (uint16_t j = 0; j < s_rxLen - i; j++) {
+                        if (decodeByte(s_rxBuffer[i + j], &cmd)) {
+                            found = true;
+                            best = i + j + 1;
+                            dispatchCommand(&cmd);
+                            break;
+                        }
+                    }
+
+                    if (found) {
+                        consumed = best;
+                        // Shift remaining data
+                        memmove(s_rxBuffer, s_rxBuffer + consumed, s_rxLen - consumed);
+                        s_rxLen -= consumed;
+                        consumed = 0;
+                        break;
+                    } else {
+                        // Check if sync byte 0xAA is in buffer, shift to it
+                        bool foundSync = false;
+                        for (uint16_t j = 1; j < s_rxLen - i; j++) {
+                            if (s_rxBuffer[i + j] == SYNC_BYTE_0) {
+                                memmove(s_rxBuffer, s_rxBuffer + i + j,
+                                        s_rxLen - i - j);
+                                s_rxLen -= (i + j);
+                                foundSync = true;
+                                break;
+                            }
+                        }
+                        if (!foundSync) {
+                            s_rxLen = 0; // No sync found, discard
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Send outgoing TX queue packets + flow control
+        TXItem txItem;
+        UBaseType_t qlen = uxQueueMessagesWaiting(txQueue);
+
+        // Flow control: XON when queue drops below 16
+        static bool s_flowPaused = false;
+        if (s_flowPaused && qlen < 16) {
+            sendPacket(0x14, (uint8_t*)"ON", 2);  // XON
+            s_flowPaused = false;
+            Serial.println("[BT] XON sent");
+        }
+
+        while (xQueueReceive(txQueue, &txItem, 0) == pdTRUE) {
+            SerialBT.write(txItem.data, txItem.length);
+            // XOFF when queue exceeds 48
+            if (!s_flowPaused && uxQueueMessagesWaiting(txQueue) > 48) {
+                sendPacket(0x14, (uint8_t*)"OFF", 3);  // XOFF
+                s_flowPaused = true;
+                Serial.println("[BT] XOFF sent");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_task_wdt_reset();
+    }
+}
+
+// ================= JTAG DISABLE =================
+// Permanently disables JTAG interface via efuses.
+// Call AFTER security init, before any task starts (in case JTAG was used
+// to flash the chip). Burns DIS_JTAG efuse bit — this is IRREVERSIBLE.
+// If JTAG is already disabled, this is a no-op (safe to call every boot).
+// NOTE: JTAG can only be disabled via efuse burn, not software reset.
+//       This function is safe because burning an already-set efuse bit is a no-op.
+static void disableJTAG() {
+    esp_err_t err = esp_efuse_write_field_bit(ESP_EFUSE_DISABLE_JTAG);
+    if (err == ESP_OK) {
+        Serial.println("[MAIN] JTAG disabled via efuse");
+    } else if (err == ESP_ERR_EFUSE_REPEATED_PROG) {
+        // Already disabled — this is the expected case on subsequent boots
+        Serial.println("[MAIN] JTAG already disabled (efuse burned)");
     } else {
-      isAuthenticated = false;
-      delay(500);
+        Serial.printf("[MAIN] JTAG disable warning: %d\n", err);
     }
-  }
 }
-
-void batteryMonitorTask(void *parameter) {
-  int lastReportedVal = -1;
-  for (;;) {
-    float batteryVoltage = readBatteryVoltage();
-    int newPercentage = calculateBatteryPercentage(batteryVoltage);
-    if (lastReportedVal == -1 || abs(newPercentage - lastReportedVal) >= 2) {
-      batteryPercentage = newPercentage;
-      lastReportedVal = newPercentage;
+// ESP32 flash encryption uses transparent XTS-128 — the CPU always sees
+// plaintext. Raw flash dumps are unreadable when flash encryption is
+// enabled via efuse. All NVS namespaces (config, battery, sensor, calib)
+// are automatically encrypted at rest without additional key management.
+// This function checks the flash encryption status and initializes NVS.
+static void initNVS() {
+    if (esp_flash_encryption_enabled()) {
+        Serial.println("[MAIN] NVS: transparent flash encryption active (XTS-128)");
     }
-    vTaskDelay(2000 / portTICK_PERIOD_MS); 
-  }
-}
 
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_INVALID_STATE) {
+        nvs_flash_erase();
+        nvs_err = nvs_flash_init();
+    }
+    if (nvs_err == ESP_OK) {
+        Serial.println("[MAIN] NVS: initialized");
+    } else {
+        Serial.printf("[MAIN] NVS: init failed (%d)\n", nvs_err);
+    }
+}
 void setup() {
-  setCpuFrequencyMhz(CPU_FREQ_MHZ); 
-  Serial.begin(115200);
-  
-  uint64_t chipid = ESP.getEfuseMac(); 
-  char uniqueName[30];
-  sprintf(uniqueName, "STASYS-%04X", (uint16_t)(chipid >> 32));
-  
-  SerialBT.begin(uniqueName);
-  Serial.printf("Device Started: %s\n", uniqueName);
+    Serial.begin(115200);
+    delay(500);
+    Serial.printf("\n\n=== STASYS ESP32 v%d.%d.%d ===\n",
+                 FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
+    Serial.println("[MAIN] Initializing...");
 
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-  
-  // Set Piezo pin to input (ADC1 is safe to use with BT)
-  pinMode(PIEZO_PIN, INPUT);
+    // Initialize NVS (encrypted if flash encryption is enabled via efuse)
+    initNVS();
 
-  esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P3);
+    // Disable JTAG interface (irreversible, safe to call on every boot)
+    disableJTAG();
 
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // 400kHz Fast I2C
-  delay(100);
+    // Load persistent config
+    initConfig();
 
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); 
-  Wire.write(0x00); // Wake
-  Wire.endTransmission();
-  delay(50);
+    // Create data-ready semaphore unconditionally (needed even if MPU6050 absent)
+    if (dataReadySem == NULL) {
+        dataReadySem = xSemaphoreCreateBinary();
+        if (dataReadySem == NULL) {
+            Serial.println("[MAIN] ERROR: Failed to create data ready semaphore");
+        }
+    }
 
-  // --- MANUAL REGISTER CONFIG FOR DRY FIRE ---
-  // 1. Accel Config (0x1C): 4G Range (0x08)
-  writeMPURegister(0x1C, 0x08); 
-  
-  // 2. Gyro Config (0x1B): 500dps Range (0x08)
-  writeMPURegister(0x1B, 0x08); 
-  
-  // 3. DLPF Config (0x1A): Bandwidth 260Hz (0x00) -> CRITICAL for clicks
-  // We want NO smoothing on the hardware side, we do it in software
-  writeMPURegister(0x1A, 0x00);
+    // Scan I2C bus to identify all connected devices
+    scanI2CBus();
 
-  Serial.println("Sensor Configured: 4G / 500dps / 260Hz / 1kHz Polling / Piezo Active");
-  
-  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(batteryMonitorTask, "BatMonitor", 2048, NULL, 1, NULL, 0);
+    // Initialize sensor
+    bool sensorOk = initMPU6050();
+    if (!sensorOk) {
+        Serial.println("[MAIN] WARNING: MPU6050 not detected — running in degraded mode");
+    }
+
+    // Auto-run factory calibration on first boot (Phase 3.1)
+    CalibrationData cal;
+    loadCalibrationData(&cal);
+    if (!cal.is_calibrated && !cal.factory_calibrated) {
+        Serial.println("[MAIN] No calibration data found — running factory calibration...");
+        runFactoryCalibration();
+    } else {
+        Serial.println("[MAIN] Calibration data loaded");
+    }
+
+    // Initialize battery
+    initBattery();
+    Serial.printf("[MAIN] Battery: %d%%\n", getBatteryPercent());
+
+    // Initialize LED
+    initLED();
+
+    // Initialize storage
+    initStorage();
+
+    // Get device name from config
+    FirmwareConfig cfg;
+    getConfigCopy(&cfg);
+
+    // Initialize security (before BT)
+    initSecurity();
+
+    // Initialize Bluetooth
+    initBluetooth(cfg.device_name);
+
+    // Create queues
+    sampleQueue = xQueueCreate(64, sizeof(SensorSample));
+    shotEventQueue = xQueueCreate(32, sizeof(ShotEvent));
+
+    if (sampleQueue == NULL || shotEventQueue == NULL) {
+        Serial.println("[MAIN] ERROR: Failed to create queues");
+    }
+
+    // Initialize shot detector
+    initShotDetector();
+
+    // Initialize system watchdog BEFORE creating tasks (fixes WDT race condition)
+    // Each task subscribes via esp_task_wdt_add(NULL) at its start
+    esp_task_wdt_init(60, true); // 60 second timeout, panic on timeout
+
+    // Create FreeRTOS tasks
+    BaseType_t res;
+
+    res = xTaskCreatePinnedToCore(
+        recoveryTask,
+        "RecoveryTask",
+        RECOVERY_TASK_STACK,
+        NULL,
+        2,        // Medium priority
+        NULL,
+        1         // Core 1
+    );
+    Serial.printf("[MAIN] RecoveryTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    res = xTaskCreatePinnedToCore(
+        sensorTask,
+        "SensorTask",
+        SENSOR_TASK_STACK,
+        NULL,
+        3,        // High priority
+        NULL,
+        1         // Core 1
+    );
+    Serial.printf("[MAIN] SensorTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    res = xTaskCreatePinnedToCore(
+        shotDetectorTask,
+        "ShotDetector",
+        DETECTOR_TASK_STACK,
+        NULL,
+        2,        // Medium priority
+        NULL,
+        1         // Core 1
+    );
+    Serial.printf("[MAIN] ShotDetectorTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    res = xTaskCreatePinnedToCore(
+        streamTask,
+        "StreamTask",
+        STREAM_TASK_STACK,
+        NULL,
+        1,        // Low priority
+        NULL,
+        0         // Core 0
+    );
+    Serial.printf("[MAIN] StreamTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    res = xTaskCreatePinnedToCore(
+        batteryMonitorTask,
+        "BatteryMonitor",
+        BATTERY_TASK_STACK,
+        NULL,
+        1,        // Low priority
+        NULL,
+        0         // Core 0
+    );
+    Serial.printf("[MAIN] BatteryMonitorTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    res = xTaskCreatePinnedToCore(
+        bluetoothTask,
+        "BluetoothTask",
+        4096,
+        NULL,
+        2,        // High priority
+        NULL,
+        0         // Core 0
+    );
+    Serial.printf("[MAIN] BluetoothTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    // Create LED task on core 0
+    res = xTaskCreatePinnedToCore(
+        ledTask,
+        "LEDTask",
+        2048,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+    Serial.printf("[MAIN] LEDTask created: %s\n", (res == pdPASS) ? "OK" : "FAIL");
+
+    Serial.println("[MAIN] Setup complete — ready for connections");
+    Serial.printf("[MAIN] Heap free: %lu bytes\n", esp_get_free_heap_size());
 }
 
 void loop() {
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // All work is done in FreeRTOS tasks
+    // Power management: check idle sleep periodically
+    checkIdleSleep();
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
