@@ -34,6 +34,7 @@
 // ================= QUEUES =================
 QueueHandle_t sampleQueue    = NULL;
 QueueHandle_t shotEventQueue = NULL;
+QueueHandle_t streamQueue    = NULL;  // Separate queue for streaming (Fix: stream task)
 
 // ================= STATS =================
 static uint32_t s_sampleCounter = 0;
@@ -121,18 +122,27 @@ void sensorTask(void* param) {
         // Guard against NULL semaphore when MPU6050 is not detected
         if (dataReadySem != NULL && xSemaphoreTake(dataReadySem, pdMS_TO_TICKS(5)) == pdTRUE) {
             // Read sensor immediately
-            if (readSensorBurst(&sample) && sampleQueue != NULL) {
-                // Push to sample queue (non-blocking)
-                BaseType_t sent = xQueueSendToBack(sampleQueue, &sample, 0);
-                if (sent != pdTRUE) {
-                    s_droppedSamples++;
+            if (readSensorBurst(&sample)) {
+                // Push to both queues (non-blocking). Each consumer drains its own queue.
+                if (sampleQueue != NULL) {
+                    if (xQueueSendToBack(sampleQueue, &sample, 0) != pdTRUE) {
+                        s_droppedSamples++;
+                    }
+                }
+                if (streamQueue != NULL) {
+                    xQueueSendToBack(streamQueue, &sample, 0);
                 }
                 s_sampleCounter++;
             }
         } else {
             // Timeout or no semaphore: sensor stalled. Do a polling fallback read.
-            if (readSensorBurst(&sample) && sampleQueue != NULL) {
-                xQueueSendToBack(sampleQueue, &sample, 0);
+            if (readSensorBurst(&sample)) {
+                if (sampleQueue != NULL) {
+                    xQueueSendToBack(sampleQueue, &sample, 0);
+                }
+                if (streamQueue != NULL) {
+                    xQueueSendToBack(streamQueue, &sample, 0);
+                }
                 s_sampleCounter++;
             }
         }
@@ -174,9 +184,8 @@ void shotDetectorTask(void* param) {
                     s_shotsDetected++;
                     addShotToSession(&event);
 
-                    // Send shot event packet immediately
-                    sendPacketBlocking(PKT_TYPE_EVT_SHOT_DETECTED,
-                                       &event, sizeof(event));
+                    // Send shot event packet via TX queue (non-blocking)
+                    sendPacket(PKT_TYPE_EVT_SHOT_DETECTED, &event, sizeof(event));
 
                     // LED + haptic feedback
                     triggerShotFeedback();
@@ -220,7 +229,10 @@ void streamTask(void* param) {
 
         // Check data mode: 0=both, 1=raw-only, 2=events-only
         if (cfg.data_mode == 2) {
-            // Events only — don't stream raw data
+            // Events only — drain the stream queue to avoid buildup
+            if (streamQueue != NULL) {
+                while (xQueueReceive(streamQueue, &sample, 0) == pdTRUE) {}
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -229,22 +241,37 @@ void streamTask(void* param) {
             if (now - lastStreamTime_us >= streamInterval_us) {
                 lastStreamTime_us = now;
 
-                // Peek at latest sample (non-blocking)
-                if (sampleQueue != NULL && xQueueReceive(sampleQueue, &sample, 0) == pdTRUE) {
+                // Drain all queued samples except the last one (latest)
+                SensorSample lastSample;
+                bool gotSample = false;
+                if (streamQueue != NULL) {
+                    while (xQueueReceive(streamQueue, &sample, 0) == pdTRUE) {
+                        lastSample = sample;
+                        gotSample = true;
+                    }
+                }
+
+                // Send the latest sample (non-blocking via TX queue)
+                if (gotSample) {
                     PktRawSample pkt;
                     pkt.sample_counter = s_sampleCounter;
-                    pkt.timestamp_us = sample.timestamp_us;
-                    pkt.accel_x = sample.accel_x;
-                    pkt.accel_y = sample.accel_y;
-                    pkt.accel_z = sample.accel_z;
-                    pkt.gyro_x = sample.gyro_x;
-                    pkt.gyro_y = sample.gyro_y;
-                    pkt.gyro_z = sample.gyro_z;
-                    pkt.piezo = sample.piezo;
-                    pkt.temperature = sample.temperature;
+                    pkt.timestamp_us = lastSample.timestamp_us;
+                    pkt.accel_x = lastSample.accel_x;
+                    pkt.accel_y = lastSample.accel_y;
+                    pkt.accel_z = lastSample.accel_z;
+                    pkt.gyro_x = lastSample.gyro_x;
+                    pkt.gyro_y = lastSample.gyro_y;
+                    pkt.gyro_z = lastSample.gyro_z;
+                    pkt.piezo = lastSample.piezo;
+                    pkt.temperature = lastSample.temperature;
 
                     sendPacket(PKT_TYPE_DATA_RAW_SAMPLE, &pkt, sizeof(pkt));
                 }
+            }
+        } else {
+            // Not streaming — drain stream queue to prevent buildup
+            if (streamQueue != NULL) {
+                while (xQueueReceive(streamQueue, &sample, 0) == pdTRUE) {}
             }
         }
 
@@ -298,6 +325,9 @@ void bluetoothTask(void* param) {
     esp_task_wdt_add(NULL);
 
     DecodedPacket cmd;
+    uint32_t lastHeartbeat_ms = 0;
+    const uint32_t HEARTBEAT_INTERVAL_MS = 5000;  // Send health every 5s during session
+    bool wasConnected = false;
 
     for (;;) {
         // Check connection state
@@ -307,6 +337,8 @@ void bluetoothTask(void* param) {
             if (connected) {
                 Serial.println("[BT] Connected");
                 setLEDMode(LEDMode::CONNECTED);
+                // Clear stale RX data from previous connection
+                s_rxLen = 0;
 
                 // Auto-stop any active session on disconnect
                 if (getSessionState() == SessionState::STREAMING) {
@@ -319,9 +351,39 @@ void bluetoothTask(void* param) {
                     pkt.sensor_health = 0;
                     sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
                 }
+                wasConnected = true;
             } else {
                 Serial.println("[BT] Disconnected");
+                // Fix: Immediately restart advertising for automatic reconnection.
+                // ESP32 continues to advertise as "STASYS" so Android can reconnect
+                // without power cycling the device.
+                esp_err_t err = esp_bt_gap_set_scan_mode(
+                    ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                if (err != ESP_OK) {
+                    Serial.printf("[BT] Re-advertise failed: %d, restarting SPP...\n", err);
+                    // If advertising can't be restored, restart the BT serial service
+                    FirmwareConfig cfg;
+                    getConfigCopy(&cfg);
+                    SerialBT.begin(cfg.device_name);
+                    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                } else {
+                    Serial.println("[BT] Re-advertising for reconnect...");
+                }
                 setLEDMode(LEDMode::IDLE);
+                // Clear RX buffer on disconnect
+                s_rxLen = 0;
+                lastHeartbeat_ms = 0;  // Reset heartbeat on disconnect
+            }
+        }
+
+        // Heartbeat: send sensor health every 5s during active sessions.
+        // This lets the Android app detect dead connections and serves as keepalive.
+        if (g_btConnected && getSessionState() == SessionState::STREAMING) {
+            uint32_t now = millis();
+            if (now - lastHeartbeat_ms >= HEARTBEAT_INTERVAL_MS) {
+                lastHeartbeat_ms = now;
+                sendSensorHealthPacket();
+                Serial.println("[BT] Heartbeat sent");
             }
         }
 
@@ -388,21 +450,23 @@ void bluetoothTask(void* param) {
         TXItem txItem;
         UBaseType_t qlen = uxQueueMessagesWaiting(txQueue);
 
-        // Flow control: XON when queue drops below 16
+        // Flow control: send raw XON/XOFF bytes outside packet framing.
+        // Fix: was using type 0x14 (EVT_AUTH_CHALLENGE) as a packet type,
+        // which conflicted with the protocol. Now sending as raw RFCOMM bytes.
         static bool s_flowPaused = false;
         if (s_flowPaused && qlen < 16) {
-            sendPacket(0x14, (uint8_t*)"ON", 2);  // XON
+            SerialBT.write(0x11);  // XON (ASCII DC1)
             s_flowPaused = false;
-            Serial.println("[BT] XON sent");
+            Serial.println("[BT] XON sent (raw)");
         }
 
         while (xQueueReceive(txQueue, &txItem, 0) == pdTRUE) {
             SerialBT.write(txItem.data, txItem.length);
             // XOFF when queue exceeds 48
             if (!s_flowPaused && uxQueueMessagesWaiting(txQueue) > 48) {
-                sendPacket(0x14, (uint8_t*)"OFF", 3);  // XOFF
+                SerialBT.write(0x13);  // XOFF (ASCII DC3) — sent as raw byte
                 s_flowPaused = true;
-                Serial.println("[BT] XOFF sent");
+                Serial.println("[BT] XOFF sent (raw)");
             }
         }
 
@@ -517,6 +581,7 @@ void setup() {
     // Create queues
     sampleQueue = xQueueCreate(64, sizeof(SensorSample));
     shotEventQueue = xQueueCreate(32, sizeof(ShotEvent));
+    streamQueue = xQueueCreate(64, sizeof(SensorSample));  // Fix: separate queue for stream task
 
     if (sampleQueue == NULL || shotEventQueue == NULL) {
         Serial.println("[MAIN] ERROR: Failed to create queues");

@@ -29,5 +29,6 @@ void  sendPacket(uint8_t type, const void* payload, uint16_t len);
 void  sendAck(uint8_t commandId, uint8_t status);
 void  sendError(uint8_t code, const char* msg);
 void  sendPacketBlocking(uint8_t type, const void* payload, uint16_t len);
+void  sendSensorHealthPacket();  // Heartbeat: sent every 5s during active session
 
 #endif // BLUETOOTH_H

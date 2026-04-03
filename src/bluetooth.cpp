@@ -86,7 +86,7 @@ static void sendInfoPacket();
 static void sendConfigPacket();
 static void sendSessionStartedPacket();
 static void sendSessionStoppedPacket();
-static void sendSensorHealthPacket();
+void sendSensorHealthPacket();
 
 // ================= SECURITY =================
 
@@ -702,7 +702,7 @@ static void sendSessionStoppedPacket() {
     sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
 }
 
-static void sendSensorHealthPacket() {
+void sendSensorHealthPacket() {
     SensorHealth health;
     checkSensorHealth(&health);
 
