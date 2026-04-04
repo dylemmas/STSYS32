@@ -351,6 +351,14 @@ void checkSensorHealth(SensorHealth* health) {
     *health = s_health;
 }
 
+uint8_t getSensorHealthFlags() {
+    uint8_t flags = 0;
+    if (g_sensorDegraded) flags |= 0x01;  // HEALTH_MPU_FAULT
+    if (!s_calData.is_calibrated && !s_calData.factory_calibrated) flags |= 0x02;  // HEALTH_CAL_NEEDED
+    if (s_health.i2c_error_count > 10) flags |= 0x04;  // HEALTH_I2C_ERRORS
+    return flags;
+}
+
 void getLastAccelGyro(int16_t* accel, int16_t* gyro) {
     if (accel) {
         accel[0] = s_lastAccel[0];

@@ -348,7 +348,7 @@ void bluetoothTask(void* param) {
                     pkt.duration_ms = g_lastSession.duration_ms;
                     pkt.shot_count = g_lastSession.shot_count;
                     pkt.battery_end = getBatteryPercent();
-                    pkt.sensor_health = 0;
+                    pkt.sensor_health = getSensorHealthFlags();
                     sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
                 }
                 wasConnected = true;
@@ -515,6 +515,22 @@ static void initNVS() {
         Serial.printf("[MAIN] NVS: init failed (%d)\n", nvs_err);
     }
 }
+
+static void checkSecurityStatus() {
+    bool efuse_provisioned = isDeviceSecretProvisioned();
+    if (!efuse_provisioned) {
+        Serial.println("[MAIN] SECURITY: WARNING — no efuse device secret provisioned");
+        Serial.println("[MAIN] SECURITY: WARNING — using MAC-based secret (dev mode only)");
+    } else {
+        Serial.println("[MAIN] SECURITY: efuse device secret detected (production mode)");
+    }
+
+    if (esp_flash_encryption_enabled()) {
+        Serial.println("[MAIN] SECURITY: flash encryption ENABLED");
+    } else {
+        Serial.println("[MAIN] SECURITY: flash encryption NOT enabled (run secure boot script)");
+    }
+}
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -524,6 +540,9 @@ void setup() {
 
     // Initialize NVS (encrypted if flash encryption is enabled via efuse)
     initNVS();
+
+    // Check and report security provisioning status
+    checkSecurityStatus();
 
     // Disable JTAG interface (irreversible, safe to call on every boot)
     disableJTAG();

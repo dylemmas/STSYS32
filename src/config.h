@@ -33,6 +33,15 @@ struct CalibrationData {
     bool     factory_calibrated;
 };
 
+// ================= ADAPTIVE THRESHOLD STATE =================
+// Persisted to NVS "calib" namespace on session stop, restored on boot.
+struct AdaptiveThresholdState {
+    uint16_t shot_peaks[10];         // Ring buffer of last 10 piezo peaks
+    uint8_t  shot_peak_count;        // Number of shots in ring buffer (0-10)
+    uint32_t adaptive_threshold;     // Current adaptive threshold (mean + 2*stddev)
+    uint8_t  adaptive_enabled;        // Whether adaptive threshold is enabled
+};
+
 // ================= EXTERNALS =================
 extern SemaphoreHandle_t configMutex;
 extern FirmwareConfig g_config;
@@ -53,5 +62,9 @@ void  loadConfig(FirmwareConfig* cfg);
 bool  saveConfig(const FirmwareConfig* cfg);
 void  updateConfig(const FirmwareConfig* newCfg);
 void  getConfigCopy(FirmwareConfig* outCfg);  // Thread-safe copy
+
+// Adaptive threshold persistence (NVS "calib" namespace)
+bool  saveAdaptiveThreshold(const struct AdaptiveThresholdState* state);
+bool  loadAdaptiveThreshold(struct AdaptiveThresholdState* out);
 
 #endif // CONFIG_H

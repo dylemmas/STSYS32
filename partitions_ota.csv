@@ -1,6 +1,9 @@
 # STASYS 4MB Flash Partition Table
 # Bootloader: 0x1000 (4KB), Partition table: 0x8000 (4KB)
 # App partitions aligned to 0x10000 (64KB)
+# NOTE: To increase SPIFFS beyond 64KB, erase flash first with:
+#   esptool.py --chip esp32 --port COMX erase_flash
+#   pio run --target upload  (re-flash with new partition table)
 nvs,        data, nvs,     0x9000,  0x4000,
 otadata,    data, ota,     0xD000,  0x2000,
 factory,    app,  factory, 0x10000, 0x140000,

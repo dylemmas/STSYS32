@@ -51,5 +51,6 @@ void  initShotDetector();
 void  updateShotDetectorConfig(const FirmwareConfig* cfg);
 bool  processSample(const SensorSample* sample, ShotEvent* eventOut,
                     uint32_t session_id);
+void  saveAdaptiveThresholdState();
 
 #endif // SHOT_DETECTOR_H

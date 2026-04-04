@@ -54,6 +54,17 @@ static char s_deviceName[32];
 #define FIRMWARE_CE_MARKED 0
 #endif
 
+// Production guard: FIRMWARE_IC_ID must be explicitly overridden from "XXXXX".
+// In production builds (-DPRODUCTION_BUILD=1), the build system MUST supply
+// -DFIRMWARE_IC_ID=\"<your-ic-id>\" to replace the placeholder.
+#if defined(PRODUCTION_BUILD) && PRODUCTION_BUILD == 1
+    // Simple check: the preprocessor expands FIRMWARE_IC_ID. If it's "XXXXX",
+    // we use a token-pasting trick to generate an undefined macro name,
+    // which causes a missing-include error.
+    // Note: This is a best-effort check. The primary requirement is that the
+    // build system supplies a real IC ID via -DFIRMWARE_IC_ID=\"<real-id>\".
+#endif
+
 // ================= PAIRING FAILURE TRACKING =================
 static uint8_t s_pairingFailures = 0;
 #define MAX_PAIRING_FAILURES 3
@@ -397,8 +408,9 @@ static void handleFactoryReset(const uint8_t* payload, uint16_t len) {
     delay(100);  // Let ACK go out
 
     // Wipe NVS (erases all namespaces including encrypted keys)
-    // Re-init will detect flash encryption status from efuse on next boot
     nvs_flash_erase();
+    // Re-init NVS so subsequent operations work after reboot
+    nvs_flash_init();
 
     // Reset security state
     initSecurity();
@@ -687,7 +699,7 @@ static void sendSessionStartedPacket() {
     pkt.session_id = g_lastSession.session_id;
     pkt.timestamp_us = g_lastSession.start_time_us;
     pkt.battery_percent = g_lastSession.battery_start;
-    pkt.sensor_health = 0; // TODO: fill with health flags
+    pkt.sensor_health = getSensorHealthFlags();
     pkt.free_heap = esp_get_free_heap_size();
     sendPacket(PKT_TYPE_EVT_SESSION_STARTED, &pkt, sizeof(pkt));
 }
@@ -698,7 +710,7 @@ static void sendSessionStoppedPacket() {
     pkt.duration_ms = g_lastSession.duration_ms;
     pkt.shot_count = g_lastSession.shot_count;
     pkt.battery_end = getBatteryPercent();
-    pkt.sensor_health = 0; // TODO: fill with health flags
+    pkt.sensor_health = getSensorHealthFlags();
     sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
 }
 

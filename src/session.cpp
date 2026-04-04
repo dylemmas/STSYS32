@@ -2,10 +2,13 @@
 #include <Arduino.h>
 #include <esp_timer.h>
 #include "storage.h"
+#include "shot_detector.h"
+#include "config.h"
 
 // ================= GLOBALS =================
 SessionState g_sessionState = SessionState::IDLE;
 SessionSummary g_lastSession;
+struct ShotBuffer g_shotBuffer;
 
 static uint32_t s_sessionStartTime = 0;
 static uint8_t  s_batteryAtStart = 0;
@@ -19,6 +22,9 @@ SessionState startSession(uint32_t session_id, uint8_t battery_pct) {
     g_sessionState = SessionState::STREAMING;
     s_sessionStartTime = esp_timer_get_time();
     s_batteryAtStart = battery_pct;
+
+    // Clear shot buffer for new session
+    g_shotBuffer.count = 0;
 
     g_lastSession.session_id = session_id;
     g_lastSession.start_time_us = s_sessionStartTime;
@@ -45,8 +51,12 @@ SessionState stopSession() {
     Serial.printf("[SESSION] Stopped: shots=%d dur=%lums\n",
                   g_lastSession.shot_count, g_lastSession.duration_ms);
 
-    // Auto-save session to SPIFFS
-    saveSession(&g_lastSession, g_lastSession.shot_count, NULL);  // Shots stored separately via shot detector
+    // Persist adaptive threshold state to NVS
+    saveAdaptiveThresholdState();
+
+    // Auto-save session to SPIFFS with actual shot data
+    saveSession(&g_lastSession, g_shotBuffer.count,
+                g_shotBuffer.count > 0 ? g_shotBuffer.events : NULL);
 
     g_sessionState = SessionState::IDLE;
     return g_sessionState;
@@ -59,6 +69,16 @@ SessionState getSessionState() {
 void addShotToSession(const ShotEvent* event) {
     if (event == NULL) return;
     g_lastSession.shot_count++;
+    if (g_shotBuffer.count < SESSION_MAX_SHOTS) {
+        g_shotBuffer.events[g_shotBuffer.count++] = *event;
+    } else {
+        Serial.printf("[SESSION] WARNING: shot buffer full at %d, dropping shot %u\n",
+                      SESSION_MAX_SHOTS, g_lastSession.shot_count);
+    }
+}
+
+void clearShotBuffer() {
+    g_shotBuffer.count = 0;
 }
 
 SessionSummary getSessionSummary() {

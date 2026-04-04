@@ -9,6 +9,7 @@ FirmwareConfig g_config;
 
 // ================= STATIC =================
 static Preferences s_nvsPrefs;
+static Preferences s_nvsCalib;  // For calibration + adaptive threshold
 
 // ================= INIT =================
 void initConfig() {
@@ -118,4 +119,51 @@ void updateConfig(const FirmwareConfig* newCfg) {
 
 void getConfigCopy(FirmwareConfig* outCfg) {
     loadConfig(outCfg);
+}
+
+// ================= ADAPTIVE THRESHOLD PERSISTENCE =================
+bool saveAdaptiveThreshold(const struct AdaptiveThresholdState* state) {
+    if (state == NULL) return false;
+
+    bool ok = s_nvsCalib.begin("calib", false);
+    if (!ok) {
+        // Try creating if it doesn't exist
+        ok = s_nvsCalib.begin("calib", true);
+        if (!ok) return false;
+    }
+
+    // Save as raw blob for simplicity
+    size_t written = s_nvsCalib.putBytes("adapt", state, sizeof(struct AdaptiveThresholdState));
+    s_nvsCalib.end();
+
+    if (written == sizeof(struct AdaptiveThresholdState)) {
+        Serial.printf("[CONFIG] Saved adaptive threshold: n=%u thr=%lu\n",
+                      state->shot_peak_count, state->adaptive_threshold);
+        return true;
+    }
+    Serial.println("[CONFIG] Failed to save adaptive threshold");
+    return false;
+}
+
+bool loadAdaptiveThreshold(struct AdaptiveThresholdState* out) {
+    if (out == NULL) return false;
+
+    bool ok = s_nvsCalib.begin("calib", true);
+    if (!ok) {
+        memset(out, 0, sizeof(struct AdaptiveThresholdState));
+        return false;
+    }
+
+    size_t len = s_nvsCalib.getBytes("adapt", out, sizeof(struct AdaptiveThresholdState));
+    s_nvsCalib.end();
+
+    if (len == sizeof(struct AdaptiveThresholdState)) {
+        Serial.printf("[CONFIG] Loaded adaptive threshold: n=%u thr=%lu\n",
+                      out->shot_peak_count, out->adaptive_threshold);
+        return true;
+    }
+
+    // No saved state — initialize to zeros
+    memset(out, 0, sizeof(struct AdaptiveThresholdState));
+    return false;
 }

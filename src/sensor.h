@@ -76,6 +76,9 @@ void     runUserCalibration();
 void     loadCalibrationData(struct CalibrationData* out);
 void     saveCalibrationData(const struct CalibrationData* data);
 
+// Build sensor health flags bitmask (matches HEALTH_* in protocol.h)
+uint8_t  getSensorHealthFlags();
+
 // Low-level I2C
 void     writeMPURegister(uint8_t reg, uint8_t val);
 uint8_t  readMPURegister(uint8_t reg);

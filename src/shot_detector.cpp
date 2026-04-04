@@ -1,6 +1,7 @@
 #include "shot_detector.h"
 #include <Arduino.h>
 #include <math.h>
+#include "config.h"
 
 // ================= GLOBALS =================
 DetectionState g_detectState;
@@ -29,6 +30,27 @@ void initShotDetector() {
 
     // Load default config
     memcpy(&s_localCfg, &g_detectConfig, sizeof(FirmwareConfig));
+
+    // Restore adaptive threshold state from NVS
+    AdaptiveThresholdState saved;
+    if (loadAdaptiveThreshold(&saved)) {
+        memcpy(g_detectState.shot_peaks, saved.shot_peaks, sizeof(saved.shot_peaks));
+        g_detectState.shot_peak_count = saved.shot_peak_count;
+        g_detectState.adaptive_threshold = saved.adaptive_threshold;
+        Serial.printf("[DETECTOR] Restored adaptive threshold: n=%u thr=%lu\n",
+                      saved.shot_peak_count, saved.adaptive_threshold);
+    }
+}
+
+void saveAdaptiveThresholdState() {
+    AdaptiveThresholdState state;
+    memcpy(state.shot_peaks, g_detectState.shot_peaks, sizeof(g_detectState.shot_peaks));
+    state.shot_peak_count = g_detectState.shot_peak_count;
+    state.adaptive_threshold = g_detectState.adaptive_threshold;
+    FirmwareConfig cfg;
+    getConfigCopy(&cfg);
+    state.adaptive_enabled = cfg.adaptive_threshold_enabled ? 1 : 0;
+    saveAdaptiveThreshold(&state);
 }
 
 void updateShotDetectorConfig(const FirmwareConfig* cfg) {

@@ -52,8 +52,9 @@ ESPSECURE = env.subst("${PIOPACKAGES}/tool-esptoolpy/espsecure.py")
 
 KEY_FILE    = "secure_boot_signing_key.pem"
 FLASH_KEY   = "flash_encryption_key.bin"
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR  = os.path.dirname(SCRIPT_DIR)
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() \
+              else os.path.join(env['PROJECT_DIR'], 'scripts')
+PROJECT_DIR  = env['PROJECT_DIR']
 KEY_PATH     = os.path.join(PROJECT_DIR, KEY_FILE)
 FLASH_KEY_PATH = os.path.join(PROJECT_DIR, FLASH_KEY)
 SIGN_MODE    = "encrypt" in sys.argv  # post:secure_boot.py:encrypt → flash encryption
@@ -287,9 +288,15 @@ def main():
         print("[secure_boot] FATAL: Cannot generate flash encryption key.")
         return
 
+    # Look for firmware binary (may not exist until link phase completes)
     bin_path = find_firmware_bin()
-    if bin_path and sign_firmware(bin_path) and SIGN_MODE:
-        encrypt_firmware(bin_path)
+    if bin_path:
+        sign_firmware(bin_path)
+        if SIGN_MODE:
+            encrypt_firmware(bin_path)
+    else:
+        print("[secure_boot] NOTE: Firmware binary not found (run after linking). "
+              "Signing skipped — re-run build to sign.")
 
     print_efuse_commands()
     print("[secure_boot] Done.")

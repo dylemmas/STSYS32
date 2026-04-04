@@ -68,22 +68,23 @@ bool getDeviceSecret(uint8_t* outSecret, size_t* outLen) {
         Serial.printf("[SEC] efuse BLOCK1 read failed: %d, falling back\n", err);
     }
 
-    // Fallback: derive from MAC for development units
+    // Fallback: derive from MAC for development units (per-device, not hardcoded).
+    // WARNING: This is NOT suitable for production. Units MUST have efuse provisioned.
     uint8_t mac[6] = {0};
     if (!getChipMAC(mac)) {
-        uint32_t chip_rev = REG_READ(0x3FF5A000 + 0x14);
-        for (int i = 0; i < 6; i++) mac[i] = (chip_rev >> (i * 4)) & 0xFF;
-        Serial.println("[SEC] WARNING: MAC read failed, using chip revision as seed");
+        Serial.println("[SEC] ERROR: Cannot read MAC — device secret unavailable");
+        return false;
     }
 
-    static const uint8_t dev_key[] = "STASYS-DEVICE-KEY";
+    // Derive secret: HMAC-SHA256(mac, mac) = per-device key from MAC itself.
+    // No hardcoded string — each device gets a unique key from its unique MAC.
     uint8_t hash[32] = {0};
-    hmac_sha256(dev_key, sizeof(dev_key) - 1, mac, 6, hash);
+    hmac_sha256(mac, 6, mac, 6, hash);
     memcpy(outSecret, hash, 16);
     *outLen = 16;
 
-    Serial.printf("[SEC] Device secret derived from chip MAC (dev mode, "
-                   "%02X:%02X:%02X:%02X:%02X:%02X)\n",
+    Serial.printf("[SEC] WARNING: No efuse provisioned — dev-mode secret from MAC "
+                   "%02X:%02X:%02X:%02X:%02X:%02X (PRODUCTION UNITS MUST PROVISION EFUSE)\n",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return true;
 }
@@ -206,8 +207,9 @@ bool verifyAuthToken(const uint8_t* token, uint32_t session_id) {
         return false;
     }
 
-    // Auth success: derive session key
-    uint8_t pin[4] = {'1', '2', '3', '4'};
+    // Auth success: derive session key using first 4 bytes of device secret as PIN.
+    // Per-device PIN (derived from efuse or MAC-based secret).
+    uint8_t pin[4] = { secret[0], secret[1], secret[2], secret[3] };
     deriveSessionKey(secret, secret_len, pin, 4, g_secState.session_key);
     g_secState.session_id = session_id;
     g_secState.link_encrypted = true;

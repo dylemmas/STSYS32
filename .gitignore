@@ -7,6 +7,10 @@
 .vscode/launch.json
 .vscode/ipch
 
+# Security keys (NEVER commit these)
+secure_boot_signing_key.pem
+flash_encryption_key.bin
+
 # Python artifacts
 __pycache__/
 *.pyc
