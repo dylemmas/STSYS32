@@ -163,6 +163,42 @@ class SessionStore:
             ),
         )
 
+    def record_imu_batch(self, session_id: int, packets: list[DataRawSample]) -> None:
+        """Insert multiple IMU samples in a single database transaction.
+
+        Uses executemany() with one commit for the entire batch, which is
+        dramatically faster than calling record_imu() per-sample.
+
+        Args:
+            session_id: The session these samples belong to.
+            packets: List of parsed DATA_RAW_SAMPLE packets.
+        """
+        if not packets:
+            return
+        rows = [
+            (
+                session_id,
+                p.timestamp_us,
+                p.accel_x,
+                p.accel_y,
+                p.accel_z,
+                p.gyro_x,
+                p.gyro_y,
+                p.gyro_z,
+                p.piezo,
+                p.temperature,
+            )
+            for p in packets
+        ]
+        self._db_conn.executemany(
+            "INSERT INTO imu_samples "
+            "(session_id, timestamp_us, accel_x, accel_y, accel_z, "
+            "gyro_x, gyro_y, gyro_z, piezo, temp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._db_conn.commit()
+
     # -------------------------------------------------------------------------
     # Retrieval
     # -------------------------------------------------------------------------

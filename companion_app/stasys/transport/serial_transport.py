@@ -18,6 +18,10 @@ BAUD_RATE = 115200
 READ_CHUNK = 1024
 
 
+XON = 0x11
+XOFF = 0x13
+
+
 class SerialTransport:
     """Manages serial connection to STASYS device.
 
@@ -29,6 +33,7 @@ class SerialTransport:
         self,
         port: Optional[str] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        flow_control: Optional[object] = None,
     ) -> None:
         """Initialize transport, optionally with a specific port.
 
@@ -37,6 +42,9 @@ class SerialTransport:
                   must be set before connect() via find_stasys_port().
             status_callback: Optional callback invoked on connection status changes.
                              Receives a string describing the new state.
+            flow_control: Optional object with handle_xon() / handle_xoff() methods.
+                          If provided, incoming XON (0x11) and XOFF (0x13) bytes
+                          are intercepted here instead of being passed to the parser.
         """
         self._port: Optional[str] = port
         self._serial: Optional[serial.Serial] = None
@@ -45,6 +53,7 @@ class SerialTransport:
         self._running: bool = False
         self._lock = threading.RLock()  # RLock so is_connected can be called inside _lock scope
         self._status_callback = status_callback or (lambda s: None)
+        self._flow_control = flow_control
 
     # -------------------------------------------------------------------------
     # Public properties
@@ -188,7 +197,12 @@ class SerialTransport:
     # -------------------------------------------------------------------------
 
     def _read_loop(self) -> None:
-        """Background thread: non-blocking drain of serial OS buffer, push bytes into queue."""
+        """Background thread: non-blocking drain of serial OS buffer, push bytes into queue.
+
+        XON (0x11) and XOFF (0x13) bytes are intercepted here and forwarded to
+        the flow control handler instead of the parser, preventing them from
+        corrupting the protocol frame scanner.
+        """
         logger.debug("Read loop started")
         while True:
             serial_dev: Optional[serial.Serial] = None
@@ -216,9 +230,44 @@ class SerialTransport:
                 break
 
             if data:
-                self._receive_queue.put(data)
+                self._dispatch_read(data)
 
         logger.debug("Read loop exited")
+
+    def _dispatch_read(self, data: bytes) -> None:
+        """Split incoming bytes: XON/XOFF to flow control, rest to parser queue."""
+        fc = self._flow_control
+        if fc is None:
+            self._receive_queue.put(data)
+            return
+
+        # Scan for XON/XOFF bytes and split the chunk.
+        # XON (0x11) and XOFF (0x13) are sent between complete protocol frames,
+        # never inside them, so splitting is safe.
+        chunks: list[bytes] = []
+        for b in data:
+            if b == XON:
+                # Flush any pending non-flow-control chunk first
+                if chunks:
+                    self._receive_queue.put(b"".join(chunks))
+                    chunks.clear()
+                try:
+                    fc.handle_xon()
+                except Exception:
+                    logger.exception("Error in flow control handle_xon")
+            elif b == XOFF:
+                if chunks:
+                    self._receive_queue.put(b"".join(chunks))
+                    chunks.clear()
+                try:
+                    fc.handle_xoff()
+                except Exception:
+                    logger.exception("Error in flow control handle_xoff")
+            else:
+                chunks.append(bytes([b]))
+
+        if chunks:
+            self._receive_queue.put(b"".join(chunks))
 
     def _handle_disconnect(self) -> None:
         """Called when the read loop detects a connection drop. Triggers reconnect."""

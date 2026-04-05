@@ -36,6 +36,7 @@ from gui.theme import (
 )
 from gui.widgets.status_bar import StatusBar
 from stasys.protocol.commands import cmd_get_info, cmd_start_session, cmd_stop_session
+from stasys.protocol.flow_control import FlowControl
 from PyQt6.QtWidgets import QCheckBox
 from stasys.protocol.parser import ProtocolParser
 from stasys.protocol.packets import (
@@ -348,6 +349,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
 
         self._transport: SerialTransport | None = None
+        self._flow: FlowControl | None = None
         self._parser: ProtocolParser | None = None
         self._router = DataRouter()
         self._packet_thread: threading.Thread | None = None
@@ -456,6 +458,7 @@ class MainWindow(QMainWindow):
             self._transport = SerialTransport(
                 port=port,
                 status_callback=self._on_transport_status,
+                flow_control=None,  # FlowControl set up below after transport exists
             )
             if not self._transport.connect(port):
                 self._status_bar.set_status(
@@ -465,6 +468,10 @@ class MainWindow(QMainWindow):
                 self._top_bar._connect_btn.setEnabled(True)
                 self._top_bar.port_input.setEnabled(True)
                 return
+            # FlowControl: write_callback → transport.write; read-path XON/XOFF
+            # interception is done inside SerialTransport._dispatch_read.
+            self._flow = FlowControl(write_callback=self._transport.write)
+            self._transport._flow_control = self._flow
         except Exception as e:
             self._status_bar.set_status(
                 f"Connection error: {e}", "error",
@@ -495,7 +502,9 @@ class MainWindow(QMainWindow):
                 break
 
     def _send_raw(self, data: bytes) -> None:
-        if self._transport and self._transport.is_connected:
+        if self._flow is not None:
+            self._flow.write(data)
+        elif self._transport and self._transport.is_connected:
             self._transport.write(data)
 
     def _on_packet(self, packet: object) -> None:
@@ -530,6 +539,7 @@ class MainWindow(QMainWindow):
         if self._transport:
             self._transport.disconnect()
             self._transport = None
+        self._flow = None
         self._parser = None
         self._session_active = False
         self._top_bar.set_disconnected()

@@ -93,6 +93,40 @@ class RawStore:
         )
         self._append_imu(self._imu_path(session_id), row)
 
+    def record_imu_batch(self, session_id: int, packets: list[DataRawSample]) -> None:
+        """Append multiple IMU samples in a single I/O operation.
+
+        Loads the existing .npy file once, appends all rows, and saves once.
+        This is far more efficient than calling record_imu() per-sample.
+
+        Args:
+            session_id: The session these samples belong to.
+            packets: List of parsed DATA_RAW_SAMPLE packets.
+        """
+        if not packets:
+            return
+        rows = np.array(
+            [[
+                p.timestamp_us,
+                p.accel_x,
+                p.accel_y,
+                p.accel_z,
+                p.gyro_x,
+                p.gyro_y,
+                p.gyro_z,
+                p.piezo,
+                p.temperature,
+            ] for p in packets],
+            dtype=self.DTYPE,
+        )
+        path = self._imu_path(session_id)
+        if path.exists():
+            existing = np.load(path, allow_pickle=False)  # type: ignore[no-untyped-call]
+            combined = np.vstack((existing, rows))
+        else:
+            combined = rows
+        np.save(path, combined)
+
     def record_shot(self, session_id: int, packet) -> None:
         """Append a shot event to the session's shots.npy file.
 

@@ -167,6 +167,7 @@ class Monitor:
         self._transport = SerialTransport()
         self._parser = ProtocolParser(packet_callback=self._on_packet)
         self._flow = FlowControl(write_callback=self._transport.write)
+        self._transport._flow_control = self._flow  # intercept XON/XOFF from firmware
 
         # Start reader thread
         self._reader_thread = threading.Thread(target=self._reader, daemon=True, name="MonitorReader")

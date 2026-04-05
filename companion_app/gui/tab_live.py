@@ -6,7 +6,6 @@ from collections import deque
 
 import pyqtgraph as pg
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QColor, QPen
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -29,7 +28,7 @@ from stasys.protocol.packets import DataRawSample, EvtShotDetected
 class LiveTab(QWidget):
     """Live monitoring tab with real-time trace and stats."""
 
-    TRAIL_LENGTH = 150            # ~1.5s at 100Hz
+    TRAIL_LENGTH = 500            # rolling window: ~5s at 100Hz
     TRAIL_SEGMENTS = 10           # number of fading segments
     WOBBLE_WINDOW = 20            # samples for RMS calculation
 
@@ -75,15 +74,13 @@ class LiveTab(QWidget):
         self._build_ui()
         self._connect_signals()
 
-        # Update timer (GUI refresh) — 16ms = ~60 fps for smooth dot tracking
+        # Update timer (GUI refresh) — 30ms = ~33 fps.
+        # Plot is updated HERE on the timer tick rather than per-packet from the
+        # signal handler, decoupling data reception from rendering.
+        # Stats are updated on every tick (acceptable at 33 fps).
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_ui)
-        self._timer.start(16)  # 60 Hz UI refresh
-
-        # Frame counter: throttle trace redraw to every 3rd frame to avoid
-        # expensive full-history setData() calls on every render tick.
-        # Dot position still updates every frame for sub-16ms cursor feel.
-        self._trace_frame_counter = 0
+        self._timer.start(30)  # ~33 Hz UI refresh
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -154,10 +151,6 @@ class LiveTab(QWidget):
         self._pw.setYRange(-4, 4, padding=0)
         self._pw.setAspectLocked(True)
         self._pw.enableAutoRange(False)
-
-        # Crosshair at origin (finite lines through center)
-        self._pw.plot([-10, 10], [0, 0], pen=QPen(QColor(FG_DIM), 0.5))
-        self._pw.plot([0, 0], [-10, 10], pen=QPen(QColor(FG_DIM), 0.5))
 
         # Fading trail: 10 segments, alpha increases from tail to head.
         # Each segment is a separate curve so pyqtgraph can render them
@@ -446,21 +439,20 @@ class LiveTab(QWidget):
         self._score_gauge.set_score(self._last_score)
 
     def _update_ui(self) -> None:
-        """Called on timer — update plot and stats (always on main thread)."""
-        # Current dot position
+        """Called on timer (~33 Hz) — update plot and stats (always on main thread)."""
+        # Current dot position (written by _on_sample, read here)
         dot_x = self.current_angle_x
         dot_y = self.current_angle_y
 
-        # Update dot every frame for sub-16ms cursor feel
+        # Update dot
         self._dot.setData([dot_x], [dot_y])
 
         # Coordinate readout
         self._coord_label.setText(f"X: {dot_x:+.2f}°  Y: {dot_y:+.2f}°")
 
-        # Update trail segments every 3rd frame (dot is every frame).
-        # Split the trail into TRAIL_SEGMENTS slices; oldest = most transparent.
-        self._trace_frame_counter += 1
-        if self._trace_frame_counter >= 3 and self._trace_x and self._trace_y:
+        # Update trail segments — split into TRAIL_SEGMENTS slices;
+        # oldest = most transparent. Only redraw when there's data.
+        if self._trace_x and self._trace_y:
             self._trace_frame_counter = 0
             xs = list(self._trace_x)
             ys = list(self._trace_y)
@@ -552,7 +544,6 @@ class LiveTab(QWidget):
         self._wobble_window.clear()
         self._jerk_mag = 0.0
         self._phase = "—"
-        self._trace_frame_counter = 0
 
     def on_rezero(self) -> None:
         """Reset zero baseline and clear trail."""
