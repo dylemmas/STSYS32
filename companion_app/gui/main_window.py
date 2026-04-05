@@ -360,7 +360,7 @@ class MainWindow(QMainWindow):
         self._current_session_db_id: int | None = None
         self._session_timeout_timer = QTimer()
         self._session_timeout_timer.setSingleShot(True)
-        self._session_timeout_timer.timeout.connect(self._on_session_timeout)
+        self._session_timeout_timer.timeout.connect(self._on_session_start_failed)
 
         # App settings (local-only, no firmware sync for MVP)
         self._settings = {
