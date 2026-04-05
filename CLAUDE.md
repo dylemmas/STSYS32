@@ -111,8 +111,8 @@ I2C Error → recoveryQueue → RecoveryTask → recoverI2CBus() → reinit MPU6
 #### ESP32 → Python (Responses & Events)
 | Type | Name | Payload | Description |
 |------|------|---------|-------------|
-| 0x10 | EVT_SESSION_STARTED | 15 bytes | Session started, includes metadata |
-| 0x11 | EVT_SESSION_STOPPED | 14 bytes | Session ended, includes summary |
+| 0x10 | EVT_SESSION_STARTED | 14 bytes | Session started, includes metadata |
+| 0x11 | EVT_SESSION_STOPPED | 12 bytes | Session ended, includes summary |
 | 0x12 | EVT_SHOT_DETECTED | 29 bytes | Shot detected event |
 | 0x13 | EVT_SENSOR_HEALTH | 13 bytes | Periodic health report |
 | 0x14 | EVT_AUTH_CHALLENGE | 20 bytes | Auth challenge from server |
@@ -151,16 +151,16 @@ session_id: 4 bytes
 challenge: 16 bytes            (random)
 ```
 
-**EVT_SESSION_STARTED (15 bytes)**:
+**EVT_SESSION_STARTED (14 bytes)**:
 ```
 session_id: 4 bytes          (unique per session)
 timestamp_us: 4 bytes        (session start, microseconds)
 battery_percent: 1 byte      (0-100)
 sensor_health: 1 byte        (health flags)
-free_heap: 4 bytes          (free RAM in bytes)
+free_heap: 4 bytes           (free RAM in bytes)
 ```
 
-**EVT_SESSION_STOPPED (14 bytes)**:
+**EVT_SESSION_STOPPED (12 bytes)**:
 ```
 session_id: 4 bytes
 duration_ms: 4 bytes
@@ -394,8 +394,10 @@ python tools/loopback_test.py     # Protocol round-trip test over SPP
 - The ESP32 streams continuously during a session. Handle backpressure gracefully — if Python can't keep up, samples will be dropped in the TX queue. The companion app implements XON/XOFF flow control.
 - Shot detection is firmware-side (dual-threshold on piezo + accel jerk). Python receives both raw data AND shot events simultaneously.
 - The firmware uses CRC-16/CCITT (seed=0xFFFF). Verify CRC on received packets; discard corrupted ones. The companion app's parser does this automatically.
+- **Parser debug logging**: Enable with `PARSER_DEBUG = True` or `parser.set_debug(True)`. Logs every parsed packet's type byte (hex), name, and CRC result at DEBUG level. CRC failures are always logged regardless of the flag.
 - Data mode `0` (both) streams raw samples + sends shot events. Use `2` (events-only) for lowest bandwidth usage.
 - **Adaptive thresholds**: After 5 shots, the detector computes mean + 2*stddev of piezo peaks and self-tunes. Threshold suggestions are printed on session stop.
+- **Stale session guard**: If the ESP32 has an active session from a prior connection (e.g. BT dropout without clean disconnect), `handleStartSession` calls `stopSession()` first before starting a fresh session with a new ID. This prevents `EVT_SESSION_STARTED` timeouts in the companion app.
 - **LED**: LEDC PWM on GPIO2 with configurable brightness (0-255). Patterns: BOOTING (1Hz blink), IDLE (double-blink), CONNECTED (solid), STREAMING (sine breathing), SHOT (3x rapid flash), LOW_BATTERY (slow pulse), ERROR (SOS).
 - **Haptic**: LEDC PWM on GPIO32 (150Hz), configurable intensity. Fires on shot detection.
 - **TX flow control**: XON/XOFF sent when TX queue drops below 16 or exceeds 48 items.
@@ -433,7 +435,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 2.2 | Local Data Persistence | SPIFFS session storage, enumerate/download/delete via BT | DONE (src/storage.cpp, CMD_GET/DELETE_SESSION) |
 | 2.3 | Battery Safety | Discharge curve, deep sleep <5%, cycle count, health flag | DONE (src/battery.cpp:voltageToPercent, cycle tracking) |
 | 2.4 | Version Negotiation | Feature flags bitmap in RSP_INFO | DONE (protocol.h:FEATURE_*, bluetooth.cpp:sendInfoPacket) |
-| 2.5 | Factory Reset | Wipe NVS, SPIFFS, security keys | DONE (CMD_FACTORY_RESET, nvs_flash_erase) | | Wipe NVS, SPIFFS, security keys | DONE (CMD_FACTORY_RESET, nvs_flash_erase) |
+| 2.5 | Factory Reset | Wipe NVS, SPIFFS, security keys | DONE (CMD_FACTORY_RESET, nvs_flash_erase) |
 | 2.6 | Power Management | Light sleep idle, deep sleep critical battery, <10mA idle target | DONE (main.cpp:checkIdleSleep, battery.cpp:batteryCriticalShutdown) |
 
 ### Phase 3: Reliability & Robustness
@@ -450,6 +452,9 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 3.9 | TX Flow Control | XON/XOFF when TX queue >75% full | DONE (main.cpp:bluetoothTask XON/XOFF) |
 | 3.10 | Stack Overflow Detection | Enable `configCHECK_FOR_STACK_OVERFLOW`, free stack in health | DONE (platformio.ini:configCHECK_FOR_STACK_OVERFLOW=2) |
 | 3.11 | Coredump on Fatal Errors | esp_core_dump partition, CMD_GET_COREDUMP | DONE (src/coredump.cpp, CMD_ERASE_COREDUMP) |
+| 3.12 | Fix Stale Session State | `handleStartSession` now stops stale session before starting fresh one | DONE (src/bluetooth.cpp:handleStartSession) |
+| 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format corrected to match firmware byte layout | DONE (companion_app/stasys/protocol/parser.py) |
+| 3.14 | Parser Debug Logging | `PARSER_DEBUG` flag + `set_debug()` for per-packet trace | DONE (companion_app/stasys/protocol/parser.py) |
 
 ### Phase 4: Auto-Calibration
 | # | Item | Description | Status |
