@@ -67,6 +67,7 @@ class DataRouter(QObject):
     session_stopped = pyqtSignal(object)  # EvtSessionStopped
     info_received = pyqtSignal(object)    # RspInfo
     connection_changed = pyqtSignal(bool)  # connected bool
+    session_start_failed = pyqtSignal()    # timeout — no EVT_SESSION_STARTED received
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +269,7 @@ class TopBar(QWidget):
             self._shots_label.setText(f"Shots: {count}  Avg: —")
 
     def set_session_active(self, active: bool) -> None:
+        self._session_btn.setEnabled(True)
         if active:
             self._session_btn.setText("Stop Session")
             self._session_btn.setStyleSheet(
@@ -278,6 +280,28 @@ class TopBar(QWidget):
             )
         else:
             self._session_btn.setText("New Session")
+            self._session_btn.setStyleSheet(
+                f"background: {ACCENT}; color: #0d0d0d; border: 1px solid {ACCENT}; "
+                f"border-radius: 3px; padding: 5px 14px; font-family: {FONT_MONO}; "
+                f"font-size: {FONT_SIZE_SM}px; font-weight: bold; letter-spacing: 1px; "
+                f"text-transform: uppercase;"
+            )
+
+    def set_session_starting(self, starting: bool) -> None:
+        """Show pending 'Starting...' state while waiting for EVT_SESSION_STARTED."""
+        if starting:
+            self._session_btn.setText("Starting...")
+            self._session_btn.setEnabled(False)
+            self._session_btn.setStyleSheet(
+                f"background: #3a3a1a; color: #aaaaaa; border: 1px solid #666; "
+                f"border-radius: 3px; padding: 5px 14px; font-family: {FONT_MONO}; "
+                f"font-size: {FONT_SIZE_SM}px; font-weight: bold; letter-spacing: 1px; "
+                f"text-transform: uppercase;"
+            )
+        else:
+            # Revert to idle "New Session" button
+            self._session_btn.setText("New Session")
+            self._session_btn.setEnabled(self._connected)
             self._session_btn.setStyleSheet(
                 f"background: {ACCENT}; color: #0d0d0d; border: 1px solid {ACCENT}; "
                 f"border-radius: 3px; padding: 5px 14px; font-family: {FONT_MONO}; "
@@ -329,10 +353,14 @@ class MainWindow(QMainWindow):
         self._packet_thread: threading.Thread | None = None
         self._running = False
         self._session_active = False
+        self._session_pending = False        # True while waiting for EVT_SESSION_STARTED
         self._auto_start_session = False   # set True to auto-start session after connect
         self._current_firmware_session_id: int = 0
         self._shot_scores: list[float] = []
         self._current_session_db_id: int | None = None
+        self._session_timeout_timer = QTimer()
+        self._session_timeout_timer.setSingleShot(True)
+        self._session_timeout_timer.timeout.connect(self._on_session_timeout)
 
         # App settings (local-only, no firmware sync for MVP)
         self._settings = {
@@ -406,6 +434,7 @@ class MainWindow(QMainWindow):
         self._router.health_received.connect(self._on_health)
         self._router.session_started.connect(self._on_session_started)
         self._router.session_stopped.connect(self._on_session_stopped)
+        self._router.session_start_failed.connect(self._on_session_start_failed)
         self._router.info_received.connect(self._on_info)
         self._router.connection_changed.connect(self._on_connection_changed)
 
@@ -496,6 +525,8 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect(self) -> None:
         self._running = False
+        self._session_pending = False
+        self._session_timeout_timer.stop()
         if self._transport:
             self._transport.disconnect()
             self._transport = None
@@ -522,13 +553,26 @@ class MainWindow(QMainWindow):
 
     def _on_session_toggle(self) -> None:
         if self._session_active:
+            # Stop is always safe — cancel any pending start timeout
+            self._session_pending = False
+            self._session_timeout_timer.stop()
             self._send_raw(cmd_stop_session())
+        elif self._session_pending:
+            # Already waiting for EVT_SESSION_STARTED — ignore
+            return
         else:
+            # Start: guard against double-click and show pending state
+            self._session_pending = True
+            self._top_bar.set_session_starting(True)
+            self._session_timeout_timer.start(3000)  # 3-second timeout
             self._send_raw(cmd_start_session())
             self._shot_scores.clear()
             self._top_bar.update_shots(0, None)
 
     def _on_session_started(self, evt: EvtSessionStarted) -> None:
+        # Cancel any pending timeout — we got our response
+        self._session_pending = False
+        self._session_timeout_timer.stop()
         self._session_active = True
         self._current_firmware_session_id = evt.session_id
         self._top_bar.set_session_active(True)
@@ -542,7 +586,19 @@ class MainWindow(QMainWindow):
             battery_start=evt.battery_percent,
         )
 
+    def _on_session_start_failed(self) -> None:
+        """Called when 3-second timeout fires with no EVT_SESSION_STARTED."""
+        self._session_pending = False
+        self._top_bar.set_session_starting(False)   # revert button
+        self._top_bar.set_session_active(False)
+        self._status_bar.set_status(
+            "Session start timed out — is the device still connected?", "error",
+        )
+
     def _on_session_stopped(self, evt: EvtSessionStopped) -> None:
+        # Clear pending in case a stale response arrives
+        self._session_pending = False
+        self._session_timeout_timer.stop()
         self._session_active = False
         self._top_bar.set_session_active(False)
         if self._current_session_db_id:
