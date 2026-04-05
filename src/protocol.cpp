@@ -236,27 +236,19 @@ static void feedInnerDecoder(const uint8_t* data, uint16_t len) {
                 s_innerDecoder.payloadLen = byte;
                 // Accumulate CRC: feed LEN_LO byte incrementally from TYPE's accumulated CRC
                 {
-                    uint8_t lo = byte;
-                    uint16_t crc = s_innerDecoder.crcComputed;
-                    crc ^= ((uint16_t)lo << 8);
-                    for (uint8_t j = 0; j < 8; j++) {
-                        crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-                    }
-                    s_innerDecoder.crcComputed = crc;
+                    uint8_t lenLo = byte;
+                    uint16_t crc = crc16_ccitt(&lenLo, 1);
+                    s_innerDecoder.crcComputed ^= crc;
                 }
                 s_innerDecoder.state = DecoderState::READ_LEN_HI;
                 break;
             case DecoderState::READ_LEN_HI: {
                 s_innerDecoder.payloadLen |= ((uint16_t)byte << 8);
-                // Accumulate CRC: continue from accumulated TYPE + LEN_LO CRC
+                // Accumulate CRC: feed LEN_HI byte to running CRC state
                 {
-                    uint8_t hi = byte;
-                    uint16_t crc = s_innerDecoder.crcComputed;  // start from accumulated
-                    crc ^= ((uint16_t)hi << 8);
-                    for (uint8_t j = 0; j < 8; j++) {
-                        crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-                    }
-                    s_innerDecoder.crcComputed = crc;
+                    uint8_t lenHi = byte;
+                    uint16_t crc = crc16_ccitt(&lenHi, 1);
+                    s_innerDecoder.crcComputed ^= crc;
                 }
                 if (s_innerDecoder.payloadLen > MAX_PAYLOAD_SIZE) {
                     s_innerDecoder.state = DecoderState::WAIT_SYNC0;
@@ -337,36 +329,24 @@ bool decodeByte(uint8_t byte, DecodedPacket* outPkt) {
 
         case DecoderState::READ_LEN_LO:
             g_decoder.payloadLen = byte;
-            // Accumulate CRC: feed LEN_LO byte
+            // Accumulate CRC: TYPE + LEN_LO (CRC-16/CCITT feeds both bytes separately)
+            g_decoder.crcComputed = crc16_ccitt(&g_decoder.type, 1);
             {
                 uint8_t lenLo = byte;
-                g_decoder.crcComputed = crc16_ccitt(&lenLo, 1);
-                // Now combine with previous TYPE CRC
-                uint16_t crc = 0xFFFF;
-                crc ^= ((uint16_t)g_decoder.type << 8);
-                for (uint8_t j = 0; j < 8; j++) {
-                    crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-                }
-                crc ^= ((uint16_t)lenLo << 8);
-                for (uint8_t j = 0; j < 8; j++) {
-                    crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-                }
-                g_decoder.crcComputed = crc;
+                uint16_t crc = crc16_ccitt(&lenLo, 1);
+                // XOR with TYPE CRC (equivalent to feeding both bytes to crc16_ccitt)
+                g_decoder.crcComputed ^= crc;
             }
             g_decoder.state = DecoderState::READ_LEN_HI;
             break;
 
         case DecoderState::READ_LEN_HI: {
             g_decoder.payloadLen |= ((uint16_t)byte << 8);
-            // Accumulate CRC: continue from accumulated TYPE + LEN_LO CRC
+            // Accumulate CRC: feed LEN_HI byte to running CRC state
             {
-                uint8_t hi = byte;
-                uint16_t crc = g_decoder.crcComputed;  // start from accumulated
-                crc ^= ((uint16_t)hi << 8);
-                for (uint8_t j = 0; j < 8; j++) {
-                    crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-                }
-                g_decoder.crcComputed = crc;
+                uint8_t lenHi = byte;
+                uint16_t crc = crc16_ccitt(&lenHi, 1);
+                g_decoder.crcComputed ^= crc;
             }
             if (g_decoder.payloadLen > MAX_PACKET_SIZE) {
                 g_decoder.state = DecoderState::WAIT_SYNC0;

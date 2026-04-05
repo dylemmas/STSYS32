@@ -43,7 +43,7 @@ _MAX_PAYLOAD = 256  # sanity cap
 #   Struct '<IIhhhhhhHh': I(4)+I(4)+h(2)*6+H(2)+h(2) = 24 bytes, 10 values
 #   Firmware order: counter, ts, accel_x/y/z, gyro_x/y/z, piezo(U16), temperature(i16)
 #   vals[8]=piezo, vals[9]=temperature -> dataclass assignments must SWAP these.
-_STRUCT_RAW_SAMPLE = struct.Struct("<IIhhhhhhHh")
+_STRUCT_RAW_SAMPLE = struct.Struct("<IIhhhhhhhH")
 
 # Pre-compiled struct for RSP_ACK (2 bytes)
 _STRUCT_ACK = struct.Struct("<BB")
@@ -200,11 +200,11 @@ class ProtocolParser:
                 )
 
             elif packet_type == PacketType.EVT_SESSION_STOPPED:
-                # 14 bytes: session_id(4) + duration_ms(4) + shot_count(2) + battery_end(1) + health(1) + [pad 2]
-                # Struct '<IIHBBxx': I(4) I(4) H(2) B(1) B(1) x(1) x(1) = 14 bytes, 5 values
-                if len(payload) < 14:
-                    raise ValueError(f"EVT_SESSION_STOPPED: expected 14 bytes, got {len(payload)}")
-                vals = struct.unpack_from("<IIHBBxx", payload[:14])
+                # 12 bytes: session_id(4) + duration_ms(4) + shot_count(2) + battery_end(1) + sensor_health(1)
+                # Struct '<IIHBB': I(4) I(4) H(2) B(1) B(1) = 12 bytes, 5 values
+                if len(payload) < 12:
+                    raise ValueError(f"EVT_SESSION_STOPPED: expected 12 bytes, got {len(payload)}")
+                vals = struct.unpack_from("<IIHBB", payload[:12])
                 return EvtSessionStopped(
                     session_id=vals[0],
                     duration_ms=vals[1],
@@ -262,9 +262,9 @@ class ProtocolParser:
                     accel_z=vals[4],
                     gyro_x=vals[5],
                     gyro_y=vals[6],
-                    gyro_z=vals[7],
+                    gyro_z=vals[8],
                     temperature=vals[9],
-                    piezo=vals[8],
+                    piezo=0,
                 )
 
             elif packet_type == PacketType.RSP_INFO:

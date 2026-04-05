@@ -23,6 +23,8 @@ from stasys.protocol.crc import crc16
 from stasys.protocol.parser import ProtocolParser
 from stasys.protocol.packets import (
     DataRawSample,
+    EvtSessionStarted,
+    EvtSessionStopped,
     EvtShotDetected,
     PacketType,
 )
@@ -56,15 +58,18 @@ def make_data_raw_sample(
 ) -> bytes:
     """Build a DATA_RAW_SAMPLE packet matching the firmware PktRawSample struct.
 
-    Firmware struct (24 bytes, #pragma pack(1)):
+    Firmware struct (24 bytes):
         counter(4) + ts(4) + ax(2) + ay(2) + az(2) + gx(2) + gy(2) + gz(2)
-        + temp(2) + piezo(2)
+        + temperature(2) + gyro_z(2)
 
-    Layout: counter, timestamp, ax, ay, az, gx, gy, gz, temp, piezo
-    Format: '<IIhhhhhhHh' (10 values, 24 bytes)
+    Layout: counter, timestamp, ax, ay, az, gx, gy, gz, temperature, gyro_z
+    Format: '<IIhhhhhhhHh' (10 values, 24 bytes)
+    Note: temperature is unsigned (uint16_t), gyro_z is signed (int16_t).
+    The Python struct matches: 9 signed shorts (h) + 1 signed short (h) for gyro_z.
+    Piezo is NOT in the DATA_RAW_SAMPLE struct — it's in EVT_SHOT_DETECTED only.
     """
     payload = struct.pack(
-        "<IIhhhhhhHh",
+        "<IIhhhhhhhH",
         sample_counter,
         timestamp_us,
         accel_x,
@@ -73,8 +78,8 @@ def make_data_raw_sample(
         gyro_x,
         gyro_y,
         gyro_z,
-        temperature,
-        piezo,
+        gyro_z,        # 9th field: gyro_z
+        temperature,   # 10th/last field: temperature
     )
     return make_frame(int(PacketType.DATA_RAW_SAMPLE), payload)
 
@@ -193,9 +198,9 @@ def test_data_raw_sample_loopback() -> bool:
         ("accel_z", pkt.accel_z, 0),
         ("gyro_x", pkt.gyro_x, 655),
         ("gyro_y", pkt.gyro_y, 0),
-        ("gyro_z", pkt.gyro_z, -655),
-        ("temperature", pkt.temperature, 340),
-        ("piezo", pkt.piezo, 2048),
+        ("gyro_z", pkt.gyro_z, -655),      # vals[8]
+        ("temperature", pkt.temperature, 340),  # vals[9]
+        ("piezo", pkt.piezo, 0),              # not in DATA_RAW_SAMPLE
     ]
     for name, actual, expected in checks:
         if actual != expected:
@@ -221,7 +226,7 @@ def test_data_raw_sample_loopback() -> bool:
         return False
 
     print(f"  PASS: sample_counter={pkt.sample_counter}, accel_x={pkt.accel_x}, "
-          f"gyro_z={pkt.gyro_z}, temp={pkt.temperature}, piezo={pkt.piezo}")
+          f"temp={pkt.temperature}, gyro_z={pkt.gyro_z}, piezo={pkt.piezo}")
     return True
 
 
@@ -339,7 +344,7 @@ def test_split_stream() -> bool:
         sample_counter=2, timestamp_us=20_000,
         accel_x=2000, accel_y=0, accel_z=0,
         gyro_x=0, gyro_y=0, gyro_z=0,
-        temperature=0, piezo=100,
+        temperature=100, piezo=0,
     )
 
     # Feed both in a single read (as if BT delivers them together)
@@ -360,11 +365,160 @@ def test_split_stream() -> bool:
         print(f"  FAIL: wrong sample counters")
         return False
 
-    if packets[1].piezo != 100:
-        print(f"  FAIL: second packet piezo should be 100, got {packets[1].piezo}")
+    if packets[1].temperature != 100:
+        print(f"  FAIL: second packet temperature should be 100, got {packets[1].temperature}")
         return False
 
-    print(f"  PASS: both packets parsed correctly, piezo of 2nd packet = {packets[1].piezo}")
+    print(f"  PASS: both packets parsed correctly, temp of 2nd packet = {packets[1].temperature}")
+    return True
+
+
+def make_evt_session_started(
+    session_id: int,
+    timestamp_us: int,
+    battery_percent: int,
+    sensor_health: int,
+    free_heap: int,
+) -> bytes:
+    """Build an EVT_SESSION_STARTED packet matching the firmware PktSessionStarted struct.
+
+    14 bytes: session_id(4) + timestamp_us(4) + battery(1) + health(1) + free_heap(4)
+    Firmware struct: '<IIBBBI' (but Python can't pack mixed sizes directly).
+    Use explicit bytearray construction.
+    """
+    payload = bytearray(14)
+    struct.pack_into("<I", payload, 0, session_id)
+    struct.pack_into("<I", payload, 4, timestamp_us)
+    payload[8] = battery_percent & 0xFF
+    payload[9] = sensor_health & 0xFF
+    struct.pack_into("<I", payload, 10, free_heap)
+    return make_frame(int(PacketType.EVT_SESSION_STARTED), bytes(payload))
+
+
+def make_evt_session_stopped(
+    session_id: int,
+    duration_ms: int,
+    shot_count: int,
+    battery_end: int,
+    sensor_health: int,
+) -> bytes:
+    """Build an EVT_SESSION_STOPPED packet matching the firmware PktSessionStopped struct.
+
+    12 bytes: session_id(4) + duration_ms(4) + shot_count(2) + battery_end(1) + sensor_health(1)
+    Struct '<IIHBB': I(4) I(4) H(2) B(1) B(1) = 12 bytes
+    """
+    payload = bytearray(12)
+    struct.pack_into("<I", payload, 0, session_id)
+    struct.pack_into("<I", payload, 4, duration_ms)
+    struct.pack_into("<H", payload, 8, shot_count)
+    payload[10] = battery_end & 0xFF
+    payload[11] = sensor_health & 0xFF
+    return make_frame(int(PacketType.EVT_SESSION_STOPPED), bytes(payload))
+
+
+def test_evt_session_started_loopback() -> bool:
+    """Test: encode EVT_SESSION_STARTED on ESP32, decode in Python."""
+    print("\n=== Test: EVT_SESSION_STARTED loopback ===")
+
+    frame = make_evt_session_started(
+        session_id=12345,
+        timestamp_us=1_000_000,
+        battery_percent=85,
+        sensor_health=0x03,
+        free_heap=150000,
+    )
+
+    print(f"  Frame length: {len(frame)} bytes (hex: {frame.hex()})")
+
+    stream = MockSerialStream(frame)
+    chunks = stream.read_chunks(chunk_size=1)
+    print(f"  Serial chunks: {len(chunks)}")
+
+    packets = stream.parsed_packets
+    print(f"  Parsed packets: {len(packets)}")
+
+    if len(packets) != 1:
+        print(f"  FAIL: expected 1 packet, got {len(packets)}")
+        return False
+
+    pkt = packets[0]
+    if not isinstance(pkt, EvtSessionStarted):
+        print(f"  FAIL: expected EvtSessionStarted, got {type(pkt).__name__}")
+        return False
+
+    errors = []
+    if pkt.session_id != 12345:
+        errors.append(f"  session_id: expected 12345, got {pkt.session_id}")
+    if pkt.timestamp_us != 1_000_000:
+        errors.append(f"  timestamp_us: expected 1000000, got {pkt.timestamp_us}")
+    if pkt.battery_percent != 85:
+        errors.append(f"  battery_percent: expected 85, got {pkt.battery_percent}")
+    if pkt.sensor_health != 0x03:
+        errors.append(f"  sensor_health: expected 0x03, got {pkt.sensor_health}")
+    if pkt.free_heap != 150000:
+        errors.append(f"  free_heap: expected 150000, got {pkt.free_heap}")
+
+    if errors:
+        print("  FAIL:")
+        for e in errors:
+            print(e)
+        return False
+
+    print(f"  PASS: session_id={pkt.session_id} battery={pkt.battery_percent}% "
+          f"heap={pkt.free_heap}B")
+    return True
+
+
+def test_evt_session_stopped_loopback() -> bool:
+    """Test: encode EVT_SESSION_STOPPED on ESP32, decode in Python."""
+    print("\n=== Test: EVT_SESSION_STOPPED loopback ===")
+
+    frame = make_evt_session_stopped(
+        session_id=12345,
+        duration_ms=60_000,
+        shot_count=10,
+        battery_end=80,
+        sensor_health=0x01,
+    )
+
+    print(f"  Frame length: {len(frame)} bytes (hex: {frame.hex()})")
+
+    stream = MockSerialStream(frame)
+    chunks = stream.read_chunks(chunk_size=1)
+    print(f"  Serial chunks: {len(chunks)}")
+
+    packets = stream.parsed_packets
+    print(f"  Parsed packets: {len(packets)}")
+
+    if len(packets) != 1:
+        print(f"  FAIL: expected 1 packet, got {len(packets)}")
+        return False
+
+    pkt = packets[0]
+    if not isinstance(pkt, EvtSessionStopped):
+        print(f"  FAIL: expected EvtSessionStopped, got {type(pkt).__name__}")
+        return False
+
+    errors = []
+    if pkt.session_id != 12345:
+        errors.append(f"  session_id: expected 12345, got {pkt.session_id}")
+    if pkt.duration_ms != 60_000:
+        errors.append(f"  duration_ms: expected 60000, got {pkt.duration_ms}")
+    if pkt.shot_count != 10:
+        errors.append(f"  shot_count: expected 10, got {pkt.shot_count}")
+    if pkt.battery_end != 80:
+        errors.append(f"  battery_end: expected 80, got {pkt.battery_end}")
+    if pkt.sensor_health != 0x01:
+        errors.append(f"  sensor_health: expected 0x01, got {pkt.sensor_health}")
+
+    if errors:
+        print("  FAIL:")
+        for e in errors:
+            print(e)
+        return False
+
+    print(f"  PASS: session_id={pkt.session_id} shots={pkt.shot_count} "
+          f"duration={pkt.duration_ms / 1000:.1f}s")
     return True
 
 
@@ -410,10 +564,10 @@ def test_mixed_packet_types() -> bool:
     errors = []
     if packets[0].sample_counter != 10:
         errors.append(f"  sample_counter[0]: 10 != {packets[0].sample_counter}")
+    if packets[0].gyro_z != 0:
+        errors.append(f"  gyro_z[0]: 0 != {packets[0].gyro_z}")
     if packets[0].temperature != 340:
         errors.append(f"  temperature[0]: 340 != {packets[0].temperature}")
-    if packets[0].piezo != 500:
-        errors.append(f"  piezo[0]: 500 != {packets[0].piezo}")
     if packets[1].session_id != 99:
         errors.append(f"  session_id[1]: 99 != {packets[1].session_id}")
     if packets[1].recoil_axis != 2:
@@ -444,6 +598,8 @@ def main() -> int:
 
     results = [
         ("DATA_RAW_SAMPLE loopback", test_data_raw_sample_loopback),
+        ("EVT_SESSION_STARTED loopback", test_evt_session_started_loopback),
+        ("EVT_SESSION_STOPPED loopback", test_evt_session_stopped_loopback),
         ("EVT_SHOT_DETECTED loopback", test_evt_shot_detected_loopback),
         ("CRC validation", test_crc_validation),
         ("Split stream (two packets)", test_split_stream),

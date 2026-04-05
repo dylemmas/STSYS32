@@ -102,7 +102,7 @@ class EvtSessionStarted:
 
 @dataclass
 class EvtSessionStopped:
-    """Session stopped event (14 bytes).
+    """Session stopped event (12 bytes).
 
     Attributes:
         session_id: Session identifier.

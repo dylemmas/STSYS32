@@ -233,7 +233,11 @@ void sendPacket(uint8_t type, const void* payload, uint16_t len) {
         item.length = encodePacket(type, payload, len, item.data);
     }
     if (item.length > 0 && txQueue != NULL) {
+        Serial.printf("[BT] sendPacket: type=0x%02X len=%u queued=%d\n", type, len, item.length);
         xQueueSend(txQueue, &item, 0); // Non-blocking
+    } else {
+        Serial.printf("[BT] sendPacket: type=0x%02X FAILED (buf=%d queue=%p)\n",
+                      type, len, txQueue);
     }
 }
 
@@ -268,6 +272,7 @@ void sendError(uint8_t code, const char* msg) {
 static void handleStartSession(const uint8_t* payload, uint16_t len) {
     (void)payload; (void)len;
 
+    Serial.printf("[BT] handleStartSession called (len=%u)\n", len);
     uint32_t sessionId = (uint32_t)(esp_timer_get_time() & 0x7FFFFFFF); // High-entropy 31-bit ID
 
 #ifdef REQUIRE_AUTH
@@ -740,6 +745,7 @@ static bool commandRequiresAuth(uint8_t type) {
 }
 
 void dispatchCommand(const DecodedPacket* cmd) {
+    Serial.printf("[BT] dispatchCommand: type=0x%02X len=%u\n", cmd->type, cmd->payload_len);
     // Auth check for protected commands.
     // CMD_START_SESSION is excluded because it initiates the auth flow by
     // sending a challenge — the client responds with CMD_AUTH to complete it.

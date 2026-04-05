@@ -390,6 +390,14 @@ void bluetoothTask(void* param) {
         // Read incoming BT data
         int available = SerialBT.available();
         if (available > 0) {
+            // Debug: log incoming data periodically
+            static uint32_t s_debugRxCount = 0;
+            if (s_debugRxCount < 5 || available > 0) {
+                s_debugRxCount += available;
+                Serial.printf("[BT] RX: %d bytes avail (total seen=%lu)\n",
+                             available, s_debugRxCount);
+            }
+
             int toRead = min(available, (int)(sizeof(s_rxBuffer) - s_rxLen));
             if (toRead == 0) {
                 // Buffer full — don't discard everything, just wait for drain
