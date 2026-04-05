@@ -69,7 +69,7 @@ def make_data_raw_sample(
     Piezo is NOT in the DATA_RAW_SAMPLE struct — it's in EVT_SHOT_DETECTED only.
     """
     payload = struct.pack(
-        "<IIhhhhhhhH",
+        "<IIhhhhhhhh",
         sample_counter,
         timestamp_us,
         accel_x,
@@ -77,9 +77,9 @@ def make_data_raw_sample(
         accel_z,
         gyro_x,
         gyro_y,
-        gyro_z,
-        gyro_z,        # 9th field: gyro_z
-        temperature,   # 10th/last field: temperature
+        gyro_z,        # 8th field: gyro_z (offset 14)
+        gyro_z,        # 9th field: piezo (offset 20) — hardcoded to 0 in dataclass
+        temperature,   # 10th field: temperature (offset 22)
     )
     return make_frame(int(PacketType.DATA_RAW_SAMPLE), payload)
 

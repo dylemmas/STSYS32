@@ -286,15 +286,23 @@ static void handleStartSession(const uint8_t* payload, uint16_t len) {
 #else
     // Development: start session directly without auth challenge.
     // Companion app does not implement HMAC-SHA256 auth response yet.
+    //
+    // Guard against stale STREAMING state: if the firmware already has an active
+    // session (e.g. from a prior connection that wasn't cleanly stopped due to
+    // BT dropout), stop it first so startSession() can initialize a fresh session
+    // with a new ID and cleared shot buffer. Without this, the stale session would
+    // cause a timeout in the Python companion app.
+    if (getSessionState() == SessionState::STREAMING) {
+        Serial.printf("[BT] Session already active (id=%u), stopping stale session\n",
+                      g_lastSession.session_id);
+        stopSession();
+        // Allow fall-through to start a clean new session
+    }
     updateBattery();
     uint8_t batt = getBatteryPercent();
     SessionState state = startSession(sessionId, batt);
-    if (state == SessionState::STREAMING) {
-        sendSessionStartedPacket();
-        Serial.printf("[BT] Session %u started (dev mode, no auth)\n", sessionId);
-    } else {
-        sendError(0x02, "Session already active");
-    }
+    sendSessionStartedPacket();
+    Serial.printf("[BT] Session %u started (dev mode, no auth)\n", sessionId);
 #endif
 }
 

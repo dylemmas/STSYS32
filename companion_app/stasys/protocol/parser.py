@@ -6,6 +6,9 @@ Frame layout::
     [0xAA][0x55][TYPE][LEN_LO][LEN_HI][PAYLOAD...][CRC_LO][CRC_HI]
 
 CRC-16/CCITT (seed=0xFFFF) covers TYPE + LEN + PAYLOAD.
+
+Debug logging: set PARSER_DEBUG = True (or call set_debug(True)) to log every
+parsed packet's type byte, payload length, and CRC validation result.
 """
 
 from __future__ import annotations
@@ -32,6 +35,16 @@ from stasys.protocol.packets import (
 
 logger = logging.getLogger(__name__)
 
+# Set to True (or call set_debug(True)) to enable per-packet debug logging.
+# Logs: type byte (hex), payload length, CRC pass/fail for every parsed packet.
+PARSER_DEBUG = False
+
+
+def set_debug(enabled: bool) -> None:
+    """Enable or disable parser debug logging."""
+    global PARSER_DEBUG
+    PARSER_DEBUG = enabled
+
 _SYNC = b"\xAA\x55"
 _HEADER_LEN = 2 + 1 + 2  # sync + type + len
 _CRC_LEN = 2
@@ -39,10 +52,10 @@ _MAX_PAYLOAD = 256  # sanity cap
 
 
 # Pre-compiled struct for DATA_RAW_SAMPLE (24 bytes, matches firmware PktRawSample):
-#   counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+piezo(2)+temp(2)
-#   Struct '<IIhhhhhhHh': I(4)+I(4)+h(2)*6+H(2)+h(2) = 24 bytes, 10 values
-#   Firmware order: counter, ts, accel_x/y/z, gyro_x/y/z, piezo(U16), temperature(i16)
-#   vals[8]=piezo, vals[9]=temperature -> dataclass assignments must SWAP these.
+#   counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+temp(2)
+#   Struct '<IIhhhhhhhH': 2xI(8) + 8xh(16) + 1xH(2) = 24 bytes, 10 values
+#   Firmware field order: counter, ts, accel_x/y/z, gyro_x/y/z, gyro_z, temperature
+#   vals[7]=gyro_z, vals[9]=temperature (vals[8]=gz padding in this layout)
 _STRUCT_RAW_SAMPLE = struct.Struct("<IIhhhhhhhH")
 
 # Pre-compiled struct for RSP_ACK (2 bytes)
@@ -262,7 +275,7 @@ class ProtocolParser:
                     accel_z=vals[4],
                     gyro_x=vals[5],
                     gyro_y=vals[6],
-                    gyro_z=vals[8],
+                    gyro_z=vals[7],
                     temperature=vals[9],
                     piezo=0,
                 )
@@ -312,6 +325,15 @@ class ProtocolParser:
 
     def _emit(self, packet: object) -> None:
         """Dispatch a parsed packet via callback or queue."""
+        if PARSER_DEBUG:
+            pkt_type = getattr(packet, "packet_type", None)
+            if pkt_type is None:
+                pkt_type = type(packet).__name__
+            logger.debug(
+                "PARSED  type=0x%02X / %-25s  CRC=PASS",
+                int(pkt_type) if isinstance(pkt_type, PacketType) else -1,
+                str(pkt_type),
+            )
         if self._callback is not None:
             self._callback(packet)
         else:

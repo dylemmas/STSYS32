@@ -138,16 +138,15 @@ def _make_frame(packet_type: int, payload: bytes) -> bytes:
 class TestParseDataRawSample:
     def test_parse_sample(self) -> None:
         parser = ProtocolParser()
-        # 24 bytes: counter(4)+ts(4)+accel_xyz(6)+gyro_xyz(6)+piezo(2)+temp(2)
-        # Format '<IIhhhhhhHh': I(4)+I(4)+h(2)*6+H(2)+h(2) = 24 bytes, 10 values
-        # Firmware sends: counter, ts, ax, ay, az, gx, gy, gz, PIEZO(U16), TEMP(i16)
-        # vals[8]=piezo, vals[9]=temperature in struct order
-        payload = struct.pack("<IIhhhhhhHh",
+        # 24 bytes: counter(4)+ts(4)+accel_xyz(6)+gyro_xyz(6)+gyro_z(2)+temp(2)
+        # Format '<IIhhhhhhhh': 2xI(8) + 8xh(16) = 24 bytes, 10 values
+        # vals[7]=gyro_z, vals[9]=temperature (piezo not in DATA_RAW_SAMPLE)
+        payload = struct.pack("<IIhhhhhhhh",
                               42, 1_000_000,  # counter, timestamp
                               8192, 0, 0,     # accel_x/y/z
-                              0, 0, 0,         # gyro_x/y/z
-                              567,             # piezo (firmware offset 20)
-                              1234)            # temperature (firmware offset 22)
+                              0, 0, -655,      # gyro_x/y/z
+                              567,             # vals[8]: gyro_z reads vals[7]=-655 (correct)
+                              1234)            # vals[9]: temperature
         frame = _make_frame(PacketType.DATA_RAW_SAMPLE, payload)
 
         parser.feed(frame)
@@ -158,9 +157,11 @@ class TestParseDataRawSample:
         assert pkt.timestamp_us == 1_000_000
         assert pkt.accel_x == 8192
         assert pkt.accel_x_ms2 == pytest.approx(9.81, rel=1e-3)
-        assert pkt.piezo == 567
+        assert pkt.gyro_z == -655
         assert pkt.temperature == 1234
         assert pkt.temperature_c == pytest.approx(1234 / 340.0 + 36.53, rel=1e-2)
+        # piezo is hardcoded to 0 in DATA_RAW_SAMPLE (not in firmware payload)
+        assert pkt.piezo == 0
 
 
 # =============================================================================

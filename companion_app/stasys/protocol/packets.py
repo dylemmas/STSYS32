@@ -84,7 +84,7 @@ def recoil_axis_name(axis: int) -> str:
 
 @dataclass
 class EvtSessionStarted:
-    """Session started event (15 bytes).
+    """Session started event (14 bytes).
 
     Attributes:
         session_id: Unique session identifier from firmware.
