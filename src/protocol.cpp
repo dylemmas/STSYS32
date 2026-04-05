@@ -234,21 +234,21 @@ static void feedInnerDecoder(const uint8_t* data, uint16_t len) {
                 break;
             case DecoderState::READ_LEN_LO:
                 s_innerDecoder.payloadLen = byte;
-                // Accumulate CRC: feed LEN_LO byte incrementally from TYPE's accumulated CRC
+                // Accumulate CRC over TYPE + LEN_LO as a continuous sequence.
                 {
-                    uint8_t lenLo = byte;
-                    uint16_t crc = crc16_ccitt(&lenLo, 1);
-                    s_innerDecoder.crcComputed ^= crc;
+                    uint8_t hdr[2] = { s_innerDecoder.type, byte };
+                    s_innerDecoder.crcComputed = crc16_ccitt(hdr, 2);
                 }
                 s_innerDecoder.state = DecoderState::READ_LEN_HI;
                 break;
             case DecoderState::READ_LEN_HI: {
                 s_innerDecoder.payloadLen |= ((uint16_t)byte << 8);
-                // Accumulate CRC: feed LEN_HI byte to running CRC state
+                // Accumulate CRC over TYPE + LEN_LO + LEN_HI as a continuous sequence.
                 {
-                    uint8_t lenHi = byte;
-                    uint16_t crc = crc16_ccitt(&lenHi, 1);
-                    s_innerDecoder.crcComputed ^= crc;
+                    uint8_t hdr[3] = { s_innerDecoder.type,
+                                       (uint8_t)(s_innerDecoder.payloadLen & 0xFF),
+                                       byte };
+                    s_innerDecoder.crcComputed = crc16_ccitt(hdr, 3);
                 }
                 if (s_innerDecoder.payloadLen > MAX_PAYLOAD_SIZE) {
                     s_innerDecoder.state = DecoderState::WAIT_SYNC0;
@@ -329,24 +329,24 @@ bool decodeByte(uint8_t byte, DecodedPacket* outPkt) {
 
         case DecoderState::READ_LEN_LO:
             g_decoder.payloadLen = byte;
-            // Accumulate CRC: TYPE + LEN_LO (CRC-16/CCITT feeds both bytes separately)
-            g_decoder.crcComputed = crc16_ccitt(&g_decoder.type, 1);
+            // Accumulate CRC over TYPE + LEN_LO as a continuous byte sequence.
+            // CRC-16/CCITT must process bytes in order — XORing separate CRCs
+            // gives a different result. Fix: build a temp buffer and call once.
             {
-                uint8_t lenLo = byte;
-                uint16_t crc = crc16_ccitt(&lenLo, 1);
-                // XOR with TYPE CRC (equivalent to feeding both bytes to crc16_ccitt)
-                g_decoder.crcComputed ^= crc;
+                uint8_t hdr[2] = { g_decoder.type, byte };
+                g_decoder.crcComputed = crc16_ccitt(hdr, 2);
             }
             g_decoder.state = DecoderState::READ_LEN_HI;
             break;
 
         case DecoderState::READ_LEN_HI: {
             g_decoder.payloadLen |= ((uint16_t)byte << 8);
-            // Accumulate CRC: feed LEN_HI byte to running CRC state
+            // Accumulate CRC over TYPE + LEN_LO + LEN_HI as a continuous sequence.
             {
-                uint8_t lenHi = byte;
-                uint16_t crc = crc16_ccitt(&lenHi, 1);
-                g_decoder.crcComputed ^= crc;
+                uint8_t hdr[3] = { g_decoder.type,
+                                   (uint8_t)(g_decoder.payloadLen & 0xFF),
+                                   byte };
+                g_decoder.crcComputed = crc16_ccitt(hdr, 3);
             }
             if (g_decoder.payloadLen > MAX_PACKET_SIZE) {
                 g_decoder.state = DecoderState::WAIT_SYNC0;
