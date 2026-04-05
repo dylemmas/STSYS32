@@ -455,6 +455,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 3.12 | Fix Stale Session State | `handleStartSession` now stops stale session before starting fresh one | DONE (src/bluetooth.cpp:handleStartSession) |
 | 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format corrected to match firmware byte layout | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.14 | Parser Debug Logging | `PARSER_DEBUG` flag + `set_debug()` for per-packet trace | DONE (companion_app/stasys/protocol/parser.py) |
+| 3.15 | Fix RX CRC Accumulation | protocol.cpp: feed TYPE+LEN to CRC as continuous bytes, not XOR of per-byte CRCs | DONE (src/protocol.cpp:READ_LEN_LO/HI) |
 
 ### Phase 4: Auto-Calibration
 | # | Item | Description | Status |
