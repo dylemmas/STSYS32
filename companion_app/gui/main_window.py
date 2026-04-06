@@ -501,6 +501,7 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 continue
             except Exception:
+                self._logger.exception("Packet reader thread crashed — restart needed")
                 break
 
     def _send_raw(self, data: bytes) -> None:
@@ -577,8 +578,12 @@ class MainWindow(QMainWindow):
             self._session_pending = True
             self._top_bar.set_session_starting(True)
             self._session_timeout_timer.start(5000)  # 5-second timeout (bumped from 3s for Windows BT SPP batching)
-            self._send_raw(cmd_start_session())
-            self._logger.info("Session start sent — waiting for EVT_SESSION_STARTED (timeout=5s)")
+            raw = cmd_start_session()
+            self._logger.info(
+                "TX CMD_START_SESSION: %s  (expecting EVT_SESSION_STARTED reply within 5s)",
+                " ".join(f"{b:02X}" for b in raw),
+            )
+            self._send_raw(raw)
             self._shot_scores.clear()
             self._top_bar.update_shots(0, None)
 
