@@ -275,7 +275,7 @@ static void handleStartSession(const uint8_t* payload, uint16_t len) {
     Serial.printf("[BT] handleStartSession called (len=%u)\n", len);
     uint32_t sessionId = (uint32_t)(esp_timer_get_time() & 0x7FFFFFFF); // High-entropy 31-bit ID
 
-#ifdef REQUIRE_AUTH
+#ifndef REQUIRE_AUTH
     // Auth flow (Phase 1.2) — requires companion app to respond with CMD_AUTH
     PktAuthChallenge challengePkt;
     challengePkt.session_id = sessionId;
