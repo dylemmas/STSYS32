@@ -402,10 +402,11 @@ python tools/loopback_test.py     # Protocol round-trip test over mock serial
 - The ESP32 streams continuously during a session. Handle backpressure gracefully — if Python can't keep up, samples will be dropped in the TX queue. The companion app implements XON/XOFF flow control.
 - Shot detection is firmware-side (dual-threshold on piezo + accel jerk). Python receives both raw data AND shot events simultaneously.
 - The firmware uses CRC-16/CCITT (seed=0xFFFF). Verify CRC on received packets; discard corrupted ones. The companion app's parser does this automatically.
-- **Parser debug logging**: Enable with `PARSER_DEBUG = True` or `parser.set_debug(True)`. Logs every parsed packet's type byte (hex), name, and CRC result at DEBUG level. CRC failures are always logged regardless of the flag.
+- **Parser debug logging**: `PARSER_DEBUG = True` by default. Logs every parsed packet's type byte (hex), name, and CRC result at DEBUG level. CRC failures are always logged regardless of the flag. Toggle with `parser.set_debug(True/False)`.
 - Data mode `0` (both) streams raw samples + sends shot events. Use `2` (events-only) for lowest bandwidth usage.
 - **Adaptive thresholds**: After 5 shots, the detector computes mean + 2*stddev of piezo peaks and self-tunes. Threshold suggestions are printed on session stop.
 - **Stale session guard**: If the ESP32 has an active session from a prior connection (e.g. BT dropout without clean disconnect), `handleStartSession` calls `stopSession()` first before starting a fresh session with a new ID. This prevents `EVT_SESSION_STARTED` timeouts in the companion app.
+- **Session start timeout**: 5 seconds (bumped from 3s). Windows Bluetooth SPP (bthmodem.sys) batches small packets, which can delay `EVT_SESSION_STARTED` (8 bytes) by 50–100ms. The timeout accommodates stale session guard overhead (SPIFFS write) plus SPP batching.
 - **LED**: LEDC PWM on GPIO2 with configurable brightness (0-255). Patterns: BOOTING (1Hz blink), IDLE (double-blink), CONNECTED (solid), STREAMING (sine breathing), SHOT (3x rapid flash), LOW_BATTERY (slow pulse), ERROR (SOS).
 - **Haptic**: LEDC PWM on GPIO32 (150Hz), configurable intensity. Fires on shot detection.
 - **TX flow control**: XON (0x11) sent when TX queue drops below 16 items; XOFF (0x13) sent when TX queue exceeds 48 items. Sent as raw RFCOMM bytes, not framed protocol packets.

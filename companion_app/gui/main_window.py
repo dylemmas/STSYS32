@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -347,6 +348,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("STASYS - Shooting Athlete Training System")
         self.setMinimumSize(1280, 800)
         self.resize(1400, 900)
+        self._logger = logging.getLogger(__name__)
 
         self._transport: SerialTransport | None = None
         self._flow: FlowControl | None = None
@@ -574,8 +576,9 @@ class MainWindow(QMainWindow):
             # Start: guard against double-click and show pending state
             self._session_pending = True
             self._top_bar.set_session_starting(True)
-            self._session_timeout_timer.start(3000)  # 3-second timeout
+            self._session_timeout_timer.start(5000)  # 5-second timeout (bumped from 3s for Windows BT SPP batching)
             self._send_raw(cmd_start_session())
+            self._logger.info("Session start sent — waiting for EVT_SESSION_STARTED (timeout=5s)")
             self._shot_scores.clear()
             self._top_bar.update_shots(0, None)
 
@@ -586,6 +589,10 @@ class MainWindow(QMainWindow):
         self._session_active = True
         self._current_firmware_session_id = evt.session_id
         self._top_bar.set_session_active(True)
+        self._logger.info(
+            "Session started: id=%u batt=%d%% health=0x%02X heap=%u",
+            evt.session_id, evt.battery_percent, evt.sensor_health, evt.free_heap,
+        )
         self._status_bar.set_status("Session active — recording data...", "success")
 
         # Open DB session
@@ -597,10 +604,15 @@ class MainWindow(QMainWindow):
         )
 
     def _on_session_start_failed(self) -> None:
-        """Called when 3-second timeout fires with no EVT_SESSION_STARTED."""
+        """Called when 5-second timeout fires with no EVT_SESSION_STARTED."""
         self._session_pending = False
         self._top_bar.set_session_starting(False)   # revert button
         self._top_bar.set_session_active(False)
+        self._logger.warning(
+            "Session start timed out — no EVT_SESSION_STARTED received in 5s. "
+            "Check ESP32 serial output for [BT] handleStartSession and sendPacket: type=0x10. "
+            "Check parser debug logs for 0x10 packet arrival and CRC validation."
+        )
         self._status_bar.set_status(
             "Session start timed out — is the device still connected?", "error",
         )

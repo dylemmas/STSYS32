@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Set to True (or call set_debug(True)) to enable per-packet debug logging.
 # Logs: type byte (hex), payload length, CRC pass/fail for every parsed packet.
-PARSER_DEBUG = False
+PARSER_DEBUG = True
 
 
 def set_debug(enabled: bool) -> None:
