@@ -24,6 +24,7 @@ from gui.theme import (
     FG_DIM,
     ORANGE,
 )
+from stasys.protocol.commands import cmd_set_mount_mode
 
 
 class SettingsTab(QWidget):
@@ -33,6 +34,7 @@ class SettingsTab(QWidget):
         super().__init__()
         self._router = router
         self._mw = main_window
+        self._current_mount_mode = 0
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -136,46 +138,47 @@ class SettingsTab(QWidget):
 
         self._jerk_spin.valueChanged.connect(self._on_jerk_changed)
 
-        # Device Orientation
-        group4 = QGroupBox("DEVICE ORIENTATION")
+        # Mount Position
+        group4 = QGroupBox("MOUNT POSITION")
         vlayout.addWidget(group4)
         g4l = QVBoxLayout(group4)
+        g4l.setSpacing(8)
+
+        self._mount_combo = QComboBox()
+        self._mount_combo.addItems([
+            "0 — Standard (upright, Z up)",
+            "1 — Rotated 90° CW (Z yaw)",
+            "2 — Inverted 180° (Z yaw)",
+            "3 — Rotated 270° CW (Z yaw)",
+            "4 — Barrel-under (Z along barrel)",
+            "5 — Barrel-under inverted",
+            "6 — Side mount (X along barrel)",
+        ])
+        self._mount_combo.setStyleSheet(
+            f"background: {BG3}; color: {FG}; border: 1px solid {BG4}; "
+            "border-radius: 3px; padding: 6px 10px; "
+            "font-family: 'JetBrains Mono', monospace; font-size: 11px;"
+        )
+        g4l.addWidget(QLabel("Sensor orientation on weapon:"))
+        g4l.addWidget(self._mount_combo)
         g4l.addWidget(QLabel(
-            "Fixed mounting: Seeed Studio logo faces gravity\n(device vertical).",
+            "Standard: device upright on rail.\n"
+            "Barrel-under: device mounted under barrel (Picatinny).\n"
+            "Side: device on side, USB port faces target.\n"
+            "Calibrate (right column) after changing orientation.",
             styleSheet="color: #555; font-family: 'JetBrains Mono', monospace; font-size: 10px;"
         ))
 
-        # USB Port Direction
-        group5 = QGroupBox("USB PORT DIRECTION")
-        vlayout.addWidget(group5)
-        g5l = QVBoxLayout(group5)
-        g5l.setSpacing(8)
-
-        usb_row = QWidget()
-        ur_layout = QHBoxLayout(usb_row)
-        ur_layout.setContentsMargins(0, 0, 0, 0)
-        self._usb_forward_btn = QPushButton("→ Forward")
-        self._usb_backward_btn = QPushButton("← Backward")
-        self._usb_forward_btn.setCheckable(True)
-        self._usb_forward_btn.setChecked(True)
-        self._usb_backward_btn.setCheckable(True)
-        for btn in [self._usb_forward_btn, self._usb_backward_btn]:
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {BG3}; color: {FG}; border: 1px solid {BG4}; "
-                f"border-radius: 3px; padding: 6px 14px; font-family: 'JetBrains Mono', monospace; "
-                f"font-size: 11px; }}"
-                f"QPushButton:checked {{ background: {ACCENT}; color: #0d0d0d; border-color: {ACCENT}; }}"
-            )
-            ur_layout.addWidget(btn)
-        g5l.addWidget(usb_row)
-        self._usb_status = QLabel("USB → Forward (faces target)")
-        self._usb_status.setStyleSheet(
-            f"color: {ACCENT}; font-family: 'JetBrains Mono', monospace; font-size: 10px;"
+        self._mount_apply_btn = QPushButton("Apply Mount Position")
+        self._mount_apply_btn.setStyleSheet(
+            f"QPushButton {{ background: {ACCENT}; color: #0d0d0d; border: none; "
+            f"border-radius: 3px; padding: 6px 16px; font-family: 'JetBrains Mono', monospace; "
+            f"font-size: 11px; }}"
         )
-        g5l.addWidget(self._usb_status)
+        g4l.addWidget(self._mount_apply_btn)
 
-        self._usb_forward_btn.clicked.connect(self._on_usb_forward)
-        self._usb_backward_btn.clicked.connect(self._on_usb_backward)
+        self._mount_combo.currentIndexChanged.connect(self._on_mount_changed)
+        self._mount_apply_btn.clicked.connect(self._on_mount_apply)
 
         vlayout.addStretch()
         return widget
@@ -233,23 +236,17 @@ class SettingsTab(QWidget):
     def _on_jerk_changed(self, value: float) -> None:
         self._mw.get_settings()["jerk_threshold"] = value
 
-    def _on_usb_forward(self) -> None:
-        self._usb_forward_btn.setChecked(True)
-        self._usb_backward_btn.setChecked(False)
-        self._mw.get_settings()["usb_direction"] = "Forward"
-        self._usb_status.setStyleSheet(
-            f"color: {ACCENT}; font-family: 'JetBrains Mono', monospace; font-size: 10px;"
-        )
-        self._usb_status.setText("USB → Forward (faces target)")
+    def _on_mount_changed(self, index: int) -> None:
+        self._current_mount_mode = index
 
-    def _on_usb_backward(self) -> None:
-        self._usb_backward_btn.setChecked(True)
-        self._usb_forward_btn.setChecked(False)
-        self._mw.get_settings()["usb_direction"] = "Backward"
-        self._usb_status.setStyleSheet(
-            f"color: {ACCENT}; font-family: 'JetBrains Mono', monospace; font-size: 10px;"
-        )
-        self._usb_status.setText("USB ← Backward (faces shooter)")
+    def _on_mount_apply(self) -> None:
+        mode = self._current_mount_mode
+        self._mw._send_raw(cmd_set_mount_mode(mode))
+        self._mount_apply_btn.setText(f"Applied: mode {mode}")
+        # Reset button text after 2s
+        import threading
+        timer = threading.Timer(2.0, lambda: self._mount_apply_btn.setText("Apply Mount Position"))
+        timer.start()
 
     def _on_calibrate(self) -> None:
         self._mw._on_rezero()

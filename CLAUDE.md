@@ -260,7 +260,8 @@ reserved: 3 bytes
 accel_bias_x/y/z: 2 bytes each
 gyro_bias_x/y/z: 2 bytes each
 temp_coeff: 2 bytes         (degC offset per degC from 25C reference)
-mount_mode: 1 byte           (0=standard, 1=rotated_90, 2=inverted, 3=rotated_270)
+mount_mode: 1 byte           (0=standard, 1=rotated_90, 2=inverted, 3=rotated_270,
+                              4=barrel_under, 5=barrel_under_inv, 6=side_mount)
 is_calibrated: 1 byte
 factory_calibrated: 1 byte
 ```
@@ -476,7 +477,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 4.2 | User Calibration Routine | Guided calibration via app, quality score | DONE (sensor.cpp:runUserCalibration, CMD_CALIBRATE_START/STATUS) |
 | 4.3 | Adaptive Shot Thresholds | Statistical analysis of shots, self-tune thresholds | DONE (shot_detector.cpp:adaptive_threshold ring buffer, CMD_GET_SHOT_STATS) |
 | 4.4 | Temperature Compensation | Temp coeff calibration, linear correction per sample | DONE (sensor.cpp:temperature compensation in readSensorBurst) |
-| 4.5 | Mount Position Calibration | Rotation matrix for rail orientation variants | DONE (sensor.cpp:applyMountRotation, CMD_SET_MOUNT_MODE) |
+| 4.5 | Mount Position Calibration | Rotation matrix for rail orientation variants (Z yaw + X pitch + Y roll) | DONE (sensor.cpp:applyMountRotation 0-6, CMD_SET_MOUNT_MODE, companion_app GUI) |
 
 ### Phase 5: Ecosystem
 | # | Item | Description | Status |
@@ -497,7 +498,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 6.5 | Battery Certification | IEC 62133 + UN 38.3 (pre-certified cells recommended) | TODO |
 | 6.6 | RoHS/REACH | EU environmental compliance, Prop 65 (CA) | TODO |
 | 6.7 | IP54 Rating | Conformal coating, gasket, Gore-Tex vent, IP54 test | TODO |
-| 6.8 | Enclosure Design | Custom PCB (ESP32-WROOM), injection mold, Picatinny mount, drop/vibration test | TODO |
+| 6.8 | Enclosure Design | Parametric OpenSCAD model: base (Picatinny-integrated, 2-slot engagement) + lid + gasket. Files: `STASYS_enclosure.scad`, `enclosure_base.scad`, `enclosure_lid.scad`, `enclosure_BOM.md`. Hardware: M3×6mm CSK screws (4×), M3×16mm cross-bolt (1×), brass heat-set inserts (4×) | IN PROGRESS (see enclosure_BOM.md for assembly guide) |
 | 6.9 | Compliance Docs | Declaration of Conformity, test reports, user manual, SBOM, EULA | TODO |
 
 ### Implementation Order

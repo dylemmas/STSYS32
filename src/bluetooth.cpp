@@ -585,7 +585,7 @@ static void handleSetMountMode(const uint8_t* payload, uint16_t len) {
     }
     CalibrationData cal;
     loadCalibrationData(&cal);
-    cal.mount_mode = payload[0] & 0x03;
+    cal.mount_mode = payload[0] & 0x07;  // 0-6
     saveCalibrationData(&cal);
     Serial.printf("[BT] Mount mode set to %u\n", cal.mount_mode);
     sendAck(PKT_TYPE_CMD_SET_MOUNT_MODE, 0);

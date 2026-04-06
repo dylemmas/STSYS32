@@ -22,6 +22,7 @@ class PacketType(IntEnum):
     CMD_GET_INFO      = 0x03
     CMD_GET_CONFIG    = 0x04
     CMD_SET_CONFIG    = 0x05
+    CMD_SET_MOUNT_MODE = 0x25
 
     # Events: ESP32 -> Python
     EVT_SESSION_STARTED  = 0x10

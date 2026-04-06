@@ -29,6 +29,9 @@ struct CalibrationData {
     int16_t  gyro_bias_z;
     int16_t  temp_coeff;        // degC offset per degC from 25C reference
     uint8_t  mount_mode;        // 0=standard, 1=rotated_90, 2=inverted, 3=rotated_270
+                                 // 4=barrel_under (90° pitch, Z along barrel)
+                                 // 5=barrel_under_inv (270° pitch)
+                                 // 6=side_mount (90° roll)
     bool     is_calibrated;
     bool     factory_calibrated;
 };

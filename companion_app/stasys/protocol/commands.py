@@ -77,3 +77,18 @@ def cmd_set_config(config: RspConfig) -> bytes:
     payload[11:11 + len(name_bytes)] = name_bytes
     # reserved bytes remain 0
     return _encode(int(PacketType.CMD_SET_CONFIG), bytes(payload))
+
+
+def cmd_set_mount_mode(mode: int) -> bytes:
+    """Encode CMD_SET_MOUNT_MODE with mount orientation mode (0-6).
+
+    Mount modes:
+      0: Standard (device upright, Z up)
+      1: Rotated 90° clockwise (around Z)
+      2: Inverted 180° (around Z)
+      3: Rotated 270° (around Z)
+      4: Barrel-under (device on side, Z along barrel, Y up)
+      5: Barrel-under inverted (device on side, Z along barrel, upside-down)
+      6: Side mount (device on side, X along barrel)
+    """
+    return _encode(int(PacketType.CMD_SET_MOUNT_MODE), bytes([mode & 0x07]))

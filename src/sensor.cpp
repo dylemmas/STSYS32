@@ -375,19 +375,36 @@ void getLastAccelGyro(int16_t* accel, int16_t* gyro) {
 // ================= CALIBRATION =================
 
 // Apply mount rotation matrix to sensor data
+// MPU6050 axes: X=right, Y=forward (toward target), Z=up (against gravity)
+//   Gravity: az=+1g when device is upright (Z up)
+// Mount modes 0-3: device upright, rotated around Z (yaw)
+// Mount modes 4-5: device barrel-under (device Z along barrel), pitch around X
+// Mount mode 6: device side-mounted, roll around Y
 static void applyMountRotation(int16_t* ax, int16_t* ay, int16_t* az) {
     int16_t bx = *ax, by = *ay, bz = *az;
     switch (s_calData.mount_mode) {
-        case 0: // Standard: no rotation
+        case 0: // Standard: no rotation (device upright, Z up)
             break;
-        case 1: // Rotated 90° clockwise (around Z)
+        case 1: // Rotated 90° clockwise around Z (yaw +90°)
             *ax = by; *ay = -bx; *az = bz;
             break;
-        case 2: // Inverted 180°
+        case 2: // Inverted 180° around Z (yaw +180°)
             *ax = -bx; *ay = -by; *az = bz;
             break;
-        case 3: // Rotated 270° (90° counter-clockwise)
+        case 3: // Rotated 270° around Z (yaw +270°)
             *ax = -by; *ay = bx; *az = bz;
+            break;
+        case 4: // Barrel-under: 90° pitch forward (device on its side, Z points toward target)
+            // Rotate around X by +90°: Y→Z, Z→-X, X→Y
+            *ax = by; *ay = -bz; *az = bx;
+            break;
+        case 5: // Barrel-under inverted: 270° pitch (device on its side, Z points toward target, upside-down)
+            // Rotate around X by -90°: Y→-Z, Z→X, X→Y
+            *ax = by; *ay = bz; *az = -bx;
+            break;
+        case 6: // Side mount: 90° roll (device on its side, X points toward target)
+            // Rotate around Y by +90°: Z→X, X→-Z, Y→Y
+            *ax = bz; *ay = by; *az = -bx;
             break;
     }
 }
