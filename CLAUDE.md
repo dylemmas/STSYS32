@@ -1,5 +1,9 @@
 # CLAUDE.md — STASYS ESP32 Firmware
 
+> **IMPORTANT: CLAUDE.md Maintenance Rule**
+> Any time a file within this project is modified (firmware source, companion app, scripts, config, protocol, etc.), CLAUDE.md must be reviewed and updated to reflect the change before committing.
+> Specifically: if you modify `src/protocol.h`, `src/protocol.cpp`, `src/bluetooth.cpp`, `src/bluetooth.h`, `src/config.h`, `src/session.h`, `src/sensor.h`, `src/shot_detector.h`, `src/led.h`, `src/battery.h`, `src/storage.h`, `src/ota.h`, `src/security.h`, `src/coredump.h`, `src/main.cpp`, `platformio.ini`, `partitions_ota.csv`, or any file in `companion_app/stasys/protocol/`, `companion_app/stasys/transport/`, `companion_app/stasys/storage/`, `companion_app/gui/`, or `companion_app/tools/`, check whether CLAUDE.md needs updating and update it in the same commit.
+
 ## Git Workflow
 
 **Repository**: https://github.com/dylemmas/STSYS32
@@ -29,7 +33,7 @@ STASYS is a shooting athlete training device that captures muzzle trace movement
 ## Firmware
 
 - **Location**: `src/` (12 modules + main)
-- **Version**: v1.0.1
+- **Version**: v1.0.1 (platformio.ini `BUILD_VERSION_*`, reflected in RSP_INFO)
 - **Framework**: ESP32 Arduino + FreeRTOS
 - **Build**: `pio run` (PlatformIO)
 - **Flash**: `pio run --target upload`
@@ -114,7 +118,7 @@ I2C Error → recoveryQueue → RecoveryTask → recoverI2CBus() → reinit MPU6
 | 0x10 | EVT_SESSION_STARTED | 14 bytes | Session started, includes metadata |
 | 0x11 | EVT_SESSION_STOPPED | 12 bytes | Session ended, includes summary |
 | 0x12 | EVT_SHOT_DETECTED | 29 bytes | Shot detected event |
-| 0x13 | EVT_SENSOR_HEALTH | 13 bytes | Periodic health report |
+| 0x13 | EVT_SENSOR_HEALTH | 11 bytes | Periodic health report |
 | 0x14 | EVT_AUTH_CHALLENGE | 20 bytes | Auth challenge from server |
 | 0x20 | DATA_RAW_SAMPLE | 24 bytes | Continuous IMU+piezo stream |
 | 0x80 | RSP_ERROR | 33 bytes | Error response |
@@ -132,32 +136,32 @@ sample_rate_hz: 1 byte       (50, 100, or 200)
 piezo_threshold: 2 bytes     (default: 800)
 accel_threshold: 2 bytes     (default: 300)
 debounce_ms: 2 bytes          (default: 200)
-led_enabled: 1 byte           (0=off, 1=on)
-data_mode: 1 byte             (0=both, 1=raw-only, 2=events-only)
-streaming_rate_hz: 2 bytes    (default: 100)
-device_name: 20 bytes         (BT device name)
+led_enabled: 1 byte          (0=off, 1=on)
+data_mode: 1 byte            (0=both, 1=raw-only, 2=events-only)
+streaming_rate_hz: 2 bytes   (default: 100)
+device_name: 20 bytes       (BT device name)
 reserved: 15 bytes
 ```
 
 **CMD_AUTH (36 bytes)**:
 ```
 session_id: 4 bytes
-token: 32 bytes               (HMAC-SHA256 response)
+token: 32 bytes             (HMAC-SHA256 response)
 ```
 
 **EVT_AUTH_CHALLENGE (20 bytes)**:
 ```
 session_id: 4 bytes
-challenge: 16 bytes            (random)
+challenge: 16 bytes         (random)
 ```
 
 **EVT_SESSION_STARTED (14 bytes)**:
 ```
 session_id: 4 bytes          (unique per session)
-timestamp_us: 4 bytes        (session start, microseconds)
-battery_percent: 1 byte      (0-100)
+timestamp_us: 4 bytes       (session start, microseconds)
+battery_percent: 1 byte     (0-100)
 sensor_health: 1 byte        (health flags)
-free_heap: 4 bytes           (free RAM in bytes)
+free_heap: 4 bytes          (free RAM in bytes)
 ```
 
 **EVT_SESSION_STOPPED (12 bytes)**:
@@ -169,51 +173,52 @@ battery_end: 1 byte
 sensor_health: 1 byte
 ```
 
+**EVT_SENSOR_HEALTH (11 bytes)**:
+```
+mpu_present: 1 byte
+i2c_errors: 1 byte
+samples_total: 2 bytes
+samples_invalid: 2 bytes
+i2c_recovery_count: 1 byte
+reserved: 4 bytes
+```
+
 **RSP_OTA_STATUS (9 bytes)**:
 ```
-state: 1 byte             (0=IDLE,1=RECEIVING,2=VERIFYING,3=COMPLETE,4=ERROR)
+state: 1 byte              (0=IDLE,1=RECEIVING,2=VERIFYING,3=COMPLETE,4=ERROR)
 reserved: 1 byte
 bytes_received: 4 bytes
 total_expected: 4 bytes
 ```
 
-**RSP_SHOT_STATS (via RSP_ACK payload, 11 bytes)**:
-```
-shot_count: 2 bytes
-mean_peak: 2 bytes
-stddev_peak: 2 bytes
-adaptive_threshold: 4 bytes
-adaptive_enabled: 1 byte
-```
-
 **EVT_SHOT_DETECTED (29 bytes)**:
 ```
 session_id: 4 bytes
-timestamp_us: 4 bytes         (microseconds since session start)
-shot_number: 2 bytes          (sequential shot count)
-piezo_peak: 2 bytes           (peak ADC value in detection window)
+timestamp_us: 4 bytes          (microseconds since session start)
+shot_number: 2 bytes           (sequential shot count)
+piezo_peak: 2 bytes            (peak ADC value in detection window)
 accel_peak_x: 2 bytes         (raw accel at peak)
 accel_peak_y: 2 bytes
 accel_peak_z: 2 bytes
 gyro_peak_x: 2 bytes          (raw gyro at peak)
 gyro_peak_y: 2 bytes
 gyro_peak_z: 2 bytes
-recoil_axis: 1 byte            (0=X, 1=Y, 2=Z)
-recoil_sign: 1 byte            (+1 or -1)
+recoil_axis: 1 byte           (0=X, 1=Y, 2=Z)
+recoil_sign: 1 byte           (+1 or -1)
 ```
 
 **DATA_RAW_SAMPLE (24 bytes)**:
 ```
-sample_counter: 4 bytes       (incrementing sample index)
-timestamp_us: 4 bytes         (microseconds since session start)
-accel_x: 2 bytes              (raw 16-bit, 4G range: /8192.0*9.81 = m/s²)
+sample_counter: 4 bytes         (incrementing sample index)
+timestamp_us: 4 bytes          (microseconds since session start)
+accel_x: 2 bytes             (raw 16-bit, 4G range: /8192.0*9.81 = m/s²)
 accel_y: 2 bytes
 accel_z: 2 bytes
-gyro_x: 2 bytes               (raw 16-bit, 500dps range: /65.5 = deg/s)
+gyro_x: 2 bytes              (raw 16-bit, 500dps range: /65.5 = deg/s)
 gyro_y: 2 bytes
 gyro_z: 2 bytes
-piezo: 2 bytes                 (raw ADC)
-temperature: 2 bytes           (MPU6050 temp, 0.01 deg C units)
+piezo: 2 bytes               (raw ADC)
+temperature: 2 bytes          (MPU6050 temp, 0.01 deg C units)
 ```
 
 **RSP_INFO (14 bytes)**:
@@ -222,30 +227,20 @@ firmware_version: 4 bytes    (e.g. 0x010000 = v1.0.0)
 hardware_rev: 1 byte
 build_timestamp: 4 bytes
 supported_features: 2 bytes   (feature flags bitmap)
-mpu_whoami: 1 byte            (should be 0x68)
+mpu_whoami: 1 byte         (should be 0x68)
 reserved: 2 bytes
 ```
 
 **RSP_ACK (2 bytes)**:
 ```
-command_id: 1 byte            (echo of command type)
-status: 1 byte                (0=success)
+command_id: 1 byte           (echo of command type)
+status: 1 byte               (0=success)
 ```
 
 **RSP_ERROR (33 bytes)**:
 ```
 error_code: 1 byte
-message: 32 bytes             (null-terminated string)
-```
-
-**EVT_SENSOR_HEALTH (13 bytes)**:
-```
-mpu_present: 1 byte
-i2c_errors: 1 byte
-samples_total: 2 bytes
-samples_invalid: 2 bytes
-i2c_recovery_count: 1 byte
-reserved: 4 bytes
+message: 32 bytes            (null-terminated string)
 ```
 
 **SessionHeader (24 bytes, SPIFFS storage)**:
@@ -322,6 +317,7 @@ CRC computed over (IV + CIPHERTEXT + TAG)
 - **Pairing**: Just Works SSP (no PIN required)
 - **Default device name**: "STASYS" (stored in NVS)
 - **Windows COM port**: "Standard Serial over Bluetooth link (COMx)"
+- **BT TX Power**: ESP_PWR_LVL_P9 (+9dBm, maximum) — improves range on battery
 
 ## Python Companion App
 
@@ -330,53 +326,65 @@ The companion app is in `companion_app/` and communicates with the ESP32 over Bl
 ### Setup
 ```bash
 cd companion_app
-pip install -r requirements.txt     # pyserial, numpy, PyQt6, pyqtgraph, pytest
+pip install -r requirements.txt     # pyserial, PyQt6, pyqtgraph, numpy, pytest
 ```
 
 ### Running
 ```
-python main.py --scan                     # Find paired STASYS COM ports
-python main.py --console --port COM5      # Interactive console (get info, start/stop)
-python main.py --monitor --port COM5      # Live monitor with real-time IMU plot
-python main.py --monitor --port COM5 --auto-start   # Auto-starts recording
-python tools/replay.py --session 1       # Play back a recorded session
+python main.py                     # Launch PyQt6 desktop GUI (default)
+python main.py --console --port COM5  # Interactive device console
+python main.py --monitor --port COM5  # Live CLI monitor with real-time IMU output
+python main.py --monitor --port COM5 --auto-start  # Auto-starts recording
+python main.py --scan             # List available COM ports
 ```
 
 ### Architecture
 ```
 companion_app/
-├── main.py                  # Entry point
-├── tools/
-│   ├── console.py           # Interactive device console (CLI)
-│   ├── monitor.py           # Live session monitor (PyQt6 GUI)
-│   ├── replay.py            # Session playback tool
-│   ├── scan_ports.py        # COM port scanner
-│   └── loopback_test.py     # Protocol loopback test (TX→RX round-trip)
+├── main.py                  # Entry point (launches GUI, console, or monitor)
+├── gui/
+│   ├── main_window.py        # Main window, top bar, tab container, signal router
+│   ├── tab_live.py           # LIVE tab: real-time trace plot + steadiness stats
+│   ├── tab_shot_detail.py    # SHOT DETAIL tab: target plot + coaching tips
+│   ├── tab_analysis.py       # ANALYSIS tab: direction wheel + score trend
+│   ├── tab_history.py        # HISTORY tab: session list + grouping + replay
+│   ├── tab_settings.py       # SETTINGS tab: detection mode, weapon type, thresholds
+│   ├── theme.py              # Dark theme colors + QSS stylesheet
+│   └── widgets/
+│       ├── score_gauge.py    # Arc gauge for shot scores
+│       ├── direction_wheel.py  # Polar sector wheel for shot direction
+│       └── status_bar.py      # Bottom status bar
 ├── stasys/
 │   ├── protocol/            # Binary protocol layer
 │   │   ├── packets.py       # PacketType enum, dataclasses, conversion constants
 │   │   ├── parser.py        # Streaming parser with CRC-16/CCITT validation
 │   │   ├── commands.py      # Command encoder (sync + CRC framing)
 │   │   ├── flow_control.py  # XON/XOFF backpressure handling
-│   │   └── crc.py            # CRC-16/CCITT implementation
-│   ├── transport/           # Serial/BT transport
+│   │   └── crc.py          # CRC-16/CCITT implementation
+│   ├── transport/            # Serial/BT transport
 │   │   └── serial_transport.py  # SPP COM port, auto-discovery, read thread
 │   ├── storage/              # Data persistence
-│   │   ├── database.py        # SQLite schema (sessions, shots, IMU index)
+│   │   ├── database.py       # SQLite schema (sessions, shots, IMU index)
 │   │   ├── session_store.py  # Session/shot CRUD via SQLite
-│   │   ├── raw_store.py      # Raw IMU/shots in .npy files per session
-│   │   ├── conversions.py    # raw→m/s², deg/s, °C conversion
-│   │   ├── data_logger.py    # Packet → storage pipeline
-│   │   ├── analysis.py       # Session metrics (split times, group size)
-│   │   └── export.py         # CSV/JSON export
-│   └── core/                 # Core utilities (placeholder for future features)
+│   │   ├── raw_store.py     # Raw IMU/shots in .npy files per session
+│   │   ├── data_logger.py   # Background thread: packet → storage pipeline
+│   │   ├── conversions.py   # raw→m/s², deg/s, °C conversion
+│   │   ├── analysis.py      # Session metrics (split times, group size, scores)
+│   │   └── export.py        # JSON/CSV export
+│   └── core/                 # Core utilities (placeholder)
+├── tools/
+│   ├── console.py           # Interactive device console (CLI)
+│   ├── monitor.py           # Live session monitor (CLI)
+│   ├── replay.py             # Session playback tool
+│   ├── scan_ports.py        # COM port scanner
+│   └── loopback_test.py     # Protocol round-trip test over mock serial
 └── tests/                    # pytest test suite
 ```
 
 ### Tests
 ```
-python -m pytest tests/ -v        # Protocol, storage, transport, tools tests
-python tools/loopback_test.py     # Protocol round-trip test over SPP
+python -m pytest tests/ -v        # Protocol, storage, transport, GUI tests
+python tools/loopback_test.py     # Protocol round-trip test over mock serial
 ```
 
 ## Build & Scripts
@@ -400,11 +408,14 @@ python tools/loopback_test.py     # Protocol round-trip test over SPP
 - **Stale session guard**: If the ESP32 has an active session from a prior connection (e.g. BT dropout without clean disconnect), `handleStartSession` calls `stopSession()` first before starting a fresh session with a new ID. This prevents `EVT_SESSION_STARTED` timeouts in the companion app.
 - **LED**: LEDC PWM on GPIO2 with configurable brightness (0-255). Patterns: BOOTING (1Hz blink), IDLE (double-blink), CONNECTED (solid), STREAMING (sine breathing), SHOT (3x rapid flash), LOW_BATTERY (slow pulse), ERROR (SOS).
 - **Haptic**: LEDC PWM on GPIO32 (150Hz), configurable intensity. Fires on shot detection.
-- **TX flow control**: XON/XOFF sent when TX queue drops below 16 or exceeds 48 items.
+- **TX flow control**: XON (0x11) sent when TX queue drops below 16 items; XOFF (0x13) sent when TX queue exceeds 48 items. Sent as raw RFCOMM bytes, not framed protocol packets.
 - **RX buffer**: 1024 bytes, overflow counter tracked. On overflow, wait for drain rather than discard.
-- **Power management**: 5-minute idle timeout → light sleep (10s wake cycle). Critical battery (<5%) → deep sleep.
+- **Power management**: 5-minute idle timeout → light sleep (10s wake cycle) when charging. **Battery power: no sleep** — BT radio stays active at maximum TX power (+9dBm) at all times.
 - **Auth**: HMAC-SHA256 challenge/response via `CMD_AUTH`. Compile with `#define REQUIRE_AUTH 1` in bluetooth.cpp to enforce. Currently disabled for dev workflow.
 - **Encryption**: AES-128-CCM encrypted packets via `PKT_TYPE_ENCRYPTED` wrapper. Session key derived via HKDF from device secret after auth.
+- **Shot stats**: `CMD_GET_SHOT_STATS` returns shot_count, mean_peak, stddev_peak, adaptive_threshold, adaptive_enabled.
+- **Session storage**: SPIFFS stores sessions as `/sessions/<session_id>.bin` (header + shot events). Enumerate via `CMD_GET_SESSIONS`, download via `CMD_GET_SESSION_DATA`, delete via `CMD_DELETE_SESSION`.
+- **Coredump**: `CMD_GET_COREDUMP` downloads stored coredump from flash partition; `CMD_ERASE_COREDUMP` wipes it.
 
 ## Current Debug Target
 **Status**: All hardware subsystems verified (see `TEST_REPORT.md`). Ready for field testing.
@@ -441,28 +452,28 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 ### Phase 3: Reliability & Robustness
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 3.1 | **Fix CRC Decoder Bug** | protocol.cpp — incremental CRC at LEN_HI | DONE (protocol.cpp:360-365) |
-| 3.2 | **Fix Watchdog Timer Race** | main.cpp — move WDT init before task creation | DONE (main.cpp:530) |
+| 3.1 | Fix CRC Decoder Bug | protocol.cpp — incremental CRC at LEN_HI | DONE (src/protocol.cpp:330-350) |
+| 3.2 | Fix Watchdog Timer Race | main.cpp — move WDT init before task creation | DONE (main.cpp:619-621) |
 | 3.3 | Async I2C Recovery | Dedicated recovery task, sensor not blocked | DONE (main.cpp:recoveryTask, recoveryQueue) |
 | 3.4 | MPU6050 Failure Handling | Degraded mode after 5 invalid reads, suppress streaming | DONE (sensor.cpp:g_sensorDegraded) |
 | 3.5 | LED PWM Control | LEDC 8-bit PWM on GPIO2, smooth sine breathing | DONE (led.cpp, LEDMode::STREAMING) |
 | 3.6 | Haptic Intensity Control | LEDC PWM on GPIO32, configurable intensity | DONE (led.cpp:triggerShotFeedback, s_hapticIntensity) |
 | 3.7 | Build Timestamp | PlatformIO build flag | DONE (build_timestamp.py: BUILD_TIMESTAMP) |
 | 3.8 | RX Buffer Overflow | Increase to 1024 bytes, overflow counter in health | DONE (bluetooth.h:1024, s_rxOverflowCount) |
-| 3.9 | TX Flow Control | XON/XOFF when TX queue >75% full | DONE (main.cpp:bluetoothTask XON/XOFF) |
+| 3.9 | TX Flow Control | XON/XOFF when TX queue >48 items | DONE (main.cpp:bluetoothTask XON/XOFF as raw bytes) |
 | 3.10 | Stack Overflow Detection | Enable `configCHECK_FOR_STACK_OVERFLOW`, free stack in health | DONE (platformio.ini:configCHECK_FOR_STACK_OVERFLOW=2) |
-| 3.11 | Coredump on Fatal Errors | esp_core_dump partition, CMD_GET_COREDUMP | DONE (src/coredump.cpp, CMD_ERASE_COREDUMP) |
-| 3.12 | Fix Stale Session State | `handleStartSession` now stops stale session before starting fresh one | DONE (src/bluetooth.cpp:handleStartSession) |
+| 3.11 | Coredump on Fatal Errors | esp_core_dump partition, CMD_GET/ERASE_COREDUMP | DONE (src/coredump.cpp) |
+| 3.12 | Fix Stale Session State | `handleStartSession` stops stale session before starting fresh | DONE (src/bluetooth.cpp:handleStartSession) |
 | 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format corrected to match firmware byte layout | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.14 | Parser Debug Logging | `PARSER_DEBUG` flag + `set_debug()` for per-packet trace | DONE (companion_app/stasys/protocol/parser.py) |
-| 3.15 | Fix RX CRC Accumulation | protocol.cpp: feed TYPE+LEN to CRC as continuous bytes, not XOR of per-byte CRCs | DONE (src/protocol.cpp:READ_LEN_LO/HI) |
+| 3.15 | Fix RX CRC Accumulation | protocol.cpp: feed TYPE+LEN as continuous bytes, not XOR of per-byte CRCs | DONE (src/protocol.cpp:READ_LEN_LO/HI) |
 
 ### Phase 4: Auto-Calibration
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 4.1 | Factory Calibration | 500 samples at boot, compute accel/gyro bias, store in NVS | DONE (sensor.cpp:runFactoryCalibration, auto-run on first boot) |
 | 4.2 | User Calibration Routine | Guided calibration via app, quality score | DONE (sensor.cpp:runUserCalibration, CMD_CALIBRATE_START/STATUS) |
-| 4.3 | Adaptive Shot Thresholds | Statistical analysis of shots, suggest thresholds | DONE (shot_detector.cpp:adaptive_threshold ring buffer, CMD_GET_SHOT_STATS) |
+| 4.3 | Adaptive Shot Thresholds | Statistical analysis of shots, self-tune thresholds | DONE (shot_detector.cpp:adaptive_threshold ring buffer, CMD_GET_SHOT_STATS) |
 | 4.4 | Temperature Compensation | Temp coeff calibration, linear correction per sample | DONE (sensor.cpp:temperature compensation in readSensorBurst) |
 | 4.5 | Mount Position Calibration | Rotation matrix for rail orientation variants | DONE (sensor.cpp:applyMountRotation, CMD_SET_MOUNT_MODE) |
 
@@ -470,7 +481,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 5.1 | Mobile App | Flutter/React Native — BLE, real-time plot, session history | TODO |
-| 5.2 | Session Data Export | JSON/CSV/binary export via BT, USB, or app sharing | DONE (companion_app/tools/replay.py, stasys/storage/export.py) |
+| 5.2 | Session Data Export | JSON/CSV/binary export via BT, USB, or app sharing | DONE (companion_app/stasys/storage/export.py) |
 | 5.3 | Cloud Backend | REST API, JWT auth, session upload, user stats | TODO |
 | 5.4 | Analysis Features | Split times, group size estimation, recoil analysis, scores | DONE (companion_app/stasys/storage/analysis.py) |
 | 5.5 | Multi-User Accounts | User accounts, device pairing, leaderboards | TODO |
