@@ -182,10 +182,10 @@ void initBluetooth(const char* deviceName) {
     esp_bt_gap_set_security_param(sp_param, &iocap, sizeof(uint8_t));
 
     // --- STEP 3: Set BT TX power ---
-    // P3 = +3dBm (default, within FCC/CE Part 15C limits)
+    // P9 = +9dBm (maximum, improves range/reliability on battery)
     // Range: N12 (-12dBm) to P9 (+9dBm)
-    esp_bredr_tx_power_set(ESP_PWR_LVL_P3, ESP_PWR_LVL_P3);
-    Serial.println("[BT] TX power set to +3dBm (ESP_PWR_LVL_P3)");
+    esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
+    Serial.println("[BT] TX power set to +9dBm (ESP_PWR_LVL_P9)");
 
     // --- STEP 4: Begin SPP ---
     // isMaster=false -> ESP32 is slave/peripheral (Windows is master)

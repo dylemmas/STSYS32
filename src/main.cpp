@@ -55,25 +55,24 @@ static void recordActivity() {
 static void checkIdleSleep() {
     uint32_t now = millis();
 
-    // Don't sleep while connected, streaming, or charging
-    if (g_btConnected) return;
-    if (getSessionState() == SessionState::STREAMING) return;
-    if (isBatteryCharging()) return;
-
-    if (!s_sleepScheduled) {
-        if (now - s_lastActivityTime > IDLE_TIMEOUT_MS) {
-            Serial.println("[PWR] Idle timeout reached, entering light sleep...");
-            s_sleepScheduled = true;
-
-            // Light sleep for 10 seconds, wake and recheck
-            esp_sleep_enable_timer_wakeup(10 * 1000000ULL);
-            esp_light_sleep_start();
-
-            // On wake
-            s_sleepScheduled = false;
-            recordActivity();
-            Serial.println("[PWR] Woke from light sleep");
+    // NEVER sleep on battery power — keep BT discoverable at all times.
+    // Only allow light sleep when externally powered (charging via USB/TP4056).
+    if (isBatteryCharging()) {
+        if (!s_sleepScheduled) {
+            if (now - s_lastActivityTime > IDLE_TIMEOUT_MS) {
+                Serial.println("[PWR] Idle timeout reached (charging), entering light sleep...");
+                s_sleepScheduled = true;
+                esp_sleep_enable_timer_wakeup(10 * 1000000ULL);
+                esp_light_sleep_start();
+                s_sleepScheduled = false;
+                recordActivity();
+                Serial.println("[PWR] Woke from light sleep");
+            }
         }
+    } else {
+        // On battery: keep BT radio always active, no sleep allowed.
+        s_sleepScheduled = false;
+        recordActivity();  // Keep activity timer fresh so sleep is never re-scheduled
     }
 }
 
