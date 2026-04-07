@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 import pyqtgraph as pg
@@ -184,12 +185,8 @@ class LiveTab(QWidget):
         self._phase = "—"
 
         # Dot goes out of range — implement auto-scrolling so the view follows
-        # the current position. We track the rolling min/max of disp_x/y and
-        # keep the current position near the center with a ±3° padding margin.
-        self._disp_min_x: float = 0.0
-        self._disp_max_x: float = 0.0
-        self._disp_min_y: float = 0.0
-        self._disp_max_y: float = 0.0
+        # the current position. We keep the current position near the center
+        # with a ±3° padding margin.
 
         # Score
         self._last_score = 0.0
@@ -258,7 +255,7 @@ class LiveTab(QWidget):
         hlayout.addStretch()
 
         # Coordinate readout
-        self._coord_label = QLabel("X: 0.00°  Y: 0.00°")
+        self._coord_label = QLabel("X: 0.00\u00b0  Y: 0.00\u00b0")
         self._coord_label.setStyleSheet(
             "color: #555; font-family: 'JetBrains Mono', monospace; "
             "font-size: 9px; background: transparent;"
@@ -272,8 +269,8 @@ class LiveTab(QWidget):
             background="#0d0d0d",
             foreground="#e0e0e0",
         )
-        self._pw.setLabel("bottom", "degrees", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
-        self._pw.setLabel("left", "degrees", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
+        self._pw.setLabel("bottom", "deg", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
+        self._pw.setLabel("left", "deg", color="#888", font={"family": "JetBrains Mono", "size": "9px"})
         self._pw.showGrid(x=True, y=True, alpha=0.15)
         # Fixed view range — no auto-range, no camera-following.
         # Trace stays within ±4° window.
@@ -485,11 +482,7 @@ class LiveTab(QWidget):
             self._hold_start_time = 0.0
             self._stable_since = 0.0
             # Reset auto-scroll tracking
-            self._disp_min_x = 0.0
-            self._disp_max_x = 0.0
-            self._disp_min_y = 0.0
-            self._disp_max_y = 0.0
-            # Reset plot view to center (0,0) with ±4° range
+            # Reset plot view to center (0,0) with ±4 deg range
             self._pw.setXRange(-4, 4, padding=0)
             self._pw.setYRange(-4, 4, padding=0)
             self._calibration_overlay.show_calibrating(True)
@@ -550,46 +543,37 @@ class LiveTab(QWidget):
 
         calibrator = self._mw.get_calibrator()
 
-        # ── Bias-corrected gyro for integration ─────────────────────────────
-        # Two paths:
-        #   - Calibrated: subtract calibrator's mean bias from raw gyro,
-        #     then integrate (one correction only, no double-subtraction)
-        #   - Not calibrated: capture first-sample gyro as session bias,
-        #     then subtract it each subsequent sample
-        raw_gyro_x = sample.gyro_x
-        raw_gyro_y = sample.gyro_y
-
+        # ── Tilt angle from accelerometer (no drift, bounded by ±90°) ─────────
+        # After bias subtraction, accel represents gravity projected onto each axis.
+        # atan2 gives a stable angle that naturally returns to 0 when level —
+        # double-integration of raw accel would drift even with perfect bias.
         if calibrator.is_calibrated:
-            # Use calibrator's pre-computed bias directly in integration.
-            # No per-session bias capture — calibrator owns this.
-            if not self._bias_captured:
-                self._gyro_bias_x = calibrator.bias.gyro_x
-                self._gyro_bias_y = calibrator.bias.gyro_y
-                self._bias_captured = True
-            gyro_x_dps = (raw_gyro_x - self._gyro_bias_x) / 65.5
-            gyro_y_dps = (raw_gyro_y - self._gyro_bias_y) / 65.5
+            # Use calibrator for correct raw-bias subtraction before unit conversion
+            _, _, _, ax_ms2, ay_ms2, az_ms2 = calibrator.apply_bias(
+                sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                sample.accel_x, sample.accel_y, sample.accel_z,
+            )
         else:
-            # Not yet calibrated — capture first sample as session bias.
-            if not self._bias_captured:
-                self._gyro_bias_x = raw_gyro_x
-                self._gyro_bias_y = raw_gyro_y
-                self._bias_captured = True
-            gyro_x_dps = (raw_gyro_x - self._gyro_bias_x) / 65.5
-            gyro_y_dps = (raw_gyro_y - self._gyro_bias_y) / 65.5
+            ax_ms2 = sample.accel_x / 8192.0 * 9.81
+            ay_ms2 = sample.accel_y / 8192.0 * 9.81
+            az_ms2 = sample.accel_z / 8192.0 * 9.81
 
-        # Integrate bias-corrected gyro: gyro_x_dps is already bias-corrected
-        # (raw minus calibrator or first-sample bias, divided by 65.5).
-        # Do NOT subtract _gyro_bias_x again here — that's the double-subtraction bug.
-        self._angle_x += gyro_x_dps * dt
-        self._angle_y += gyro_y_dps * dt
+        # Tilt angles in degrees — naturally bounded, cannot drift.
+        # roll: left/right tilt (device y-axis rotation), pitch: forward/back tilt.
+        SCALE_X = 1.0  # degrees → plot units
+        SCALE_Y = 1.0  # degrees → plot units
+        roll  = math.degrees(math.atan2(-ax_ms2, math.sqrt(ay_ms2**2 + az_ms2**2)))
+        pitch = math.degrees(math.atan2(ay_ms2, math.sqrt(ax_ms2**2 + az_ms2**2)))
+        disp_x = roll  * SCALE_X
+        disp_y = pitch * SCALE_Y
 
         # Apply zero offset (RE-ZERO baseline)
         offset_x, offset_y = self._mw.get_zero_offset()
-        disp_x = self._angle_x - offset_x
-        disp_y = self._angle_y - offset_y
+        disp_x -= offset_x
+        disp_y -= offset_y
 
-        self.current_angle_x = self._angle_x
-        self.current_angle_y = self._angle_y
+        self.current_angle_x = disp_x
+        self.current_angle_y = disp_y
 
         # Store for fading trail
         self._trace_x.append(disp_x)
@@ -597,12 +581,12 @@ class LiveTab(QWidget):
         self._timestamps.append(sample.timestamp_us / 1_000_000.0)
 
         # Compute jerk magnitude (use raw accel here as it's not critical for calibration)
-        accel_x_raw = sample.accel_x
-        jerk_x = accel_x_raw / 8192.0 * 9.81 / dt if dt > 0 else 0
+        jerk_x = ax_ms2 / dt if dt > 0 else 0
         self._jerk_mag = abs(jerk_x)
 
-        # Steadiness metrics — gyro_x_dps is already bias-corrected,
-        # so use it directly (no further subtraction needed).
+        # Steadiness metrics — use raw gyro directly (constant bias cancels in RMS).
+        gyro_x_dps = sample.gyro_x / 65.5
+        gyro_y_dps = sample.gyro_y / 65.5
         gyro_mag = (gyro_x_dps ** 2 + gyro_y_dps ** 2) ** 0.5
         self._wobble_window.append(gyro_mag)
         self._wobble_rms = (
@@ -612,8 +596,8 @@ class LiveTab(QWidget):
 
         # Auto-scroll: keep current position centered with ±3° padding.
         # If the dot reaches within 1° of any edge, shift the view window.
-        MARGIN = 1.0        # degrees — trigger scroll when within this of edge
-        PADDING = 3.0       # degrees — new view padding around the position
+        MARGIN = 1.0        # deg — trigger scroll when within this of edge
+        PADDING = 3.0       # deg — new view padding around the position
         center_x = disp_x
         center_y = disp_y
         x_range = self._pw.viewRange()[0]
@@ -628,7 +612,7 @@ class LiveTab(QWidget):
             center_y > y_hi - MARGIN
         )
         if needs_scroll:
-            # Re-center the view on the current dot, with ±PADDING° range
+            # Re-center the view on the current dot, with ±PADDING deg range
             self._pw.setXRange(center_x - PADDING, center_x + PADDING, padding=0)
             self._pw.setYRange(center_y - PADDING, center_y + PADDING, padding=0)
             # After re-centering, reset trailing curves so they re-draw in the new coordinate space
@@ -690,7 +674,7 @@ class LiveTab(QWidget):
         self._dot.setData([dot_x], [dot_y])
 
         # Coordinate readout
-        self._coord_label.setText(f"X: {dot_x:+.2f}°  Y: {dot_y:+.2f}°")
+        self._coord_label.setText(f"X: {dot_x:+.2f}\u00b0  Y: {dot_y:+.2f}\u00b0")
 
         # Update trail segments — split into TRAIL_SEGMENTS slices;
         # oldest = most transparent. Only redraw when there's data.

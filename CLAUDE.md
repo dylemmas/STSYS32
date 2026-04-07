@@ -343,7 +343,8 @@ The Python app implements multi-layer error recovery:
 - **Accelerometer**: 4G range → raw / 8192.0 * 9.81 = m/s²
 - **Gyroscope**: 500 dps range → raw / 65.5 = deg/s
 - **Sample rate**: Configurable (default 100 Hz)
-- **Plot**: accel_x/y/z over time → trace movement in 3D
+- **Plot**: accel_x/y over time → trace movement in 2D
+- **Dot movement**: Accelerometer-based tilt angle (atan2 of calibrated accel_x/y/z → roll/pitch in degrees). After calibration bias subtraction, gravity is the dominant signal. Using atan2 gives stable angles bounded by ±90° — cannot drift unlike double-integration. Scale factor 1.0:1 (degrees → plot units).
 - **Recoil analysis**: Peak accel magnitude and direction during shot window
 
 ### Shot Detection (from EVT_SHOT_DETECTED)
