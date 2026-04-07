@@ -61,6 +61,7 @@ struct SensorHealth {
 // ================= EXTERNALS =================
 extern SemaphoreHandle_t dataReadySem;
 extern QueueHandle_t recoveryQueue;   // Signal recovery task
+extern SemaphoreHandle_t recoveryDoneSem;  // Recovery completion signal to sensorTask
 extern volatile bool g_sensorDegraded; // True when MPU is not responding
 extern uint8_t s_consecutiveErrors;  // I2C error counter (declared static in sensor.cpp)
 
@@ -78,6 +79,10 @@ void     saveCalibrationData(const struct CalibrationData* data);
 
 // Build sensor health flags bitmask (matches HEALTH_* in protocol.h)
 uint8_t  getSensorHealthFlags();
+
+// Query current sensor state (for health packet encoding)
+bool     isSensorDegraded();  // True if MPU permanently failed
+bool     isRecoveryInProgress();  // True while RecoveryTask is attempting recovery
 
 // Low-level I2C
 void     writeMPURegister(uint8_t reg, uint8_t val);

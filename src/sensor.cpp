@@ -40,6 +40,16 @@ SemaphoreHandle_t dataReadySem = NULL;
 QueueHandle_t recoveryQueue = NULL;
 volatile bool g_sensorDegraded = false;
 
+// Recovery completion notification — RecoveryTask signals this after a
+// successful reinit so sensorTask can update g_sensorDegraded.
+SemaphoreHandle_t recoveryDoneSem = NULL;
+static bool g_recoverySuccess = false;
+
+// Health flags (bit 0 = degraded, bit 1 = recovery in progress)
+static volatile uint8_t s_sensorStatusFlags = 0;
+#define STATUS_DEGRADED       0x01
+#define STATUS_RECOVERY_DONE  0x02
+
 static SensorHealth s_health = {
     .mpu_present = false,
     .mpu_whoami = 0,
@@ -55,6 +65,7 @@ static SensorHealth s_health = {
 uint8_t s_consecutiveErrors = 0;  // Non-static: accessed by recoveryTask in main.cpp
 static uint8_t s_recoveryFailCount = 0;
 static uint8_t s_consecutiveInvalidReads = 0;
+static bool s_recoveryInProgress = false;
 
 // Last valid reading (for graceful degradation)
 static int16_t s_lastAccel[3] = {0, 0, 0};
@@ -163,6 +174,13 @@ bool initMPU6050() {
         recoveryQueue = xQueueCreate(1, sizeof(bool));
     }
 
+    // Create recovery completion semaphore
+    if (recoveryDoneSem == NULL) {
+        recoveryDoneSem = xSemaphoreCreateBinary();
+        // Take it initially so the first wait returns only on recovery completion
+        xSemaphoreTake(recoveryDoneSem, 0);
+    }
+
     // Attach interrupt to MPU INT pin
     pinMode(MPU_INT_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(MPU_INT_PIN), mpuISR, RISING);
@@ -199,10 +217,13 @@ bool readSensorBurst(SensorSample* sample) {
         s_consecutiveErrors++;
         s_health.samples_invalid++;
 
-        // Signal async recovery task (non-blocking)
-        if (s_consecutiveErrors > 5 && recoveryQueue != NULL) {
+        // Signal async recovery task (non-blocking) after 5 consecutive errors.
+        // RecoveryTask clears s_consecutiveErrors and g_sensorDegraded on success.
+        if (s_consecutiveErrors > 5 && recoveryQueue != NULL && !s_recoveryInProgress) {
             bool signal = true;
             xQueueSend(recoveryQueue, &signal, 0);
+            s_recoveryInProgress = true;
+            Serial.println("[SENSOR] 5+ consecutive I2C errors — signaling RecoveryTask");
         }
         goto invalid_read;
     }
@@ -265,10 +286,27 @@ bool readSensorBurst(SensorSample* sample) {
     s_health.last_read_valid = true;
     s_consecutiveInvalidReads = 0;
 
-    // Clear degraded mode on successful read
+    // Clear degraded mode on successful read (fix: also clear after recovery completes)
     if (g_sensorDegraded) {
         g_sensorDegraded = false;
-        Serial.println("[SENSOR] MPU6050 recovered");
+        s_sensorStatusFlags &= ~STATUS_DEGRADED;
+        Serial.println("[SENSOR] MPU6050 recovered from degraded mode");
+    }
+
+    // Check for recovery completion signal from RecoveryTask
+    if (xSemaphoreTake(recoveryDoneSem, 0) == pdTRUE) {
+        // RecoveryTask completed — update degraded flag based on outcome
+        g_sensorDegraded = !g_recoverySuccess;
+        if (g_recoverySuccess) {
+            g_sensorDegraded = false;
+            s_sensorStatusFlags &= ~STATUS_DEGRADED;
+            Serial.println("[SENSOR] RecoveryTask completed: sensor healthy");
+        } else {
+            g_sensorDegraded = true;
+            s_sensorStatusFlags |= STATUS_DEGRADED;
+            Serial.println("[SENSOR] RecoveryTask completed: PERMANENTLY DEGRADED");
+        }
+        s_recoveryInProgress = false;
     }
 
     // Update last valid values for graceful degradation
@@ -282,10 +320,13 @@ bool readSensorBurst(SensorSample* sample) {
     return true;
 
 invalid_read:
-    // Count consecutive invalid reads for degraded mode
-    if (++s_consecutiveInvalidReads >= 5) {
+    // Count consecutive invalid reads for degraded mode.
+    // Only enter degraded mode if recovery is NOT in progress — let
+    // RecoveryTask attempt recovery first before suppressing streaming.
+    if (!s_recoveryInProgress && ++s_consecutiveInvalidReads >= 5) {
         if (!g_sensorDegraded) {
             g_sensorDegraded = true;
+            s_sensorStatusFlags |= STATUS_DEGRADED;
             Serial.println("[SENSOR] Entering degraded mode (5 consecutive invalid reads)");
         }
     }
@@ -332,13 +373,21 @@ void recoverI2CBus() {
     bool reinit = initMPU6050();
     if (reinit) {
         s_recoveryFailCount = 0;
-        Serial.println("[SENSOR] I2C recovery successful");
+        s_consecutiveErrors = 0;  // Reset error counter on successful recovery
+        g_recoverySuccess = true;
+        Serial.println("[SENSOR] I2C recovery successful — sensor operational");
     } else {
         s_recoveryFailCount++;
+        g_recoverySuccess = false;
         Serial.printf("[SENSOR] I2C recovery failed (attempt %d)\n", s_recoveryFailCount);
         if (s_recoveryFailCount >= 3) {
-            Serial.println("[SENSOR] FATAL: MPU6050 recovery failed 3 times");
+            Serial.println("[SENSOR] FATAL: MPU6050 recovery failed 3 times — permanently degraded");
         }
+    }
+
+    // Signal completion so sensorTask can update g_sensorDegraded
+    if (recoveryDoneSem != NULL) {
+        xSemaphoreGive(recoveryDoneSem);
     }
 
     s_health.i2c_recovery_count++;
@@ -356,6 +405,7 @@ uint8_t getSensorHealthFlags() {
     if (g_sensorDegraded) flags |= 0x01;  // HEALTH_MPU_FAULT
     if (!s_calData.is_calibrated && !s_calData.factory_calibrated) flags |= 0x02;  // HEALTH_CAL_NEEDED
     if (s_health.i2c_error_count > 10) flags |= 0x04;  // HEALTH_I2C_ERRORS
+    if (s_recoveryInProgress) flags |= 0x08;           // HEALTH_RECOVERY_IN_PROGRESS
     return flags;
 }
 
@@ -370,6 +420,14 @@ void getLastAccelGyro(int16_t* accel, int16_t* gyro) {
         gyro[1] = s_lastGyro[1];
         gyro[2] = s_lastGyro[2];
     }
+}
+
+bool isSensorDegraded() {
+    return g_sensorDegraded;
+}
+
+bool isRecoveryInProgress() {
+    return s_recoveryInProgress;
 }
 
 // ================= CALIBRATION =================

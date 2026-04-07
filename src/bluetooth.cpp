@@ -737,9 +737,13 @@ void sendSensorHealthPacket() {
     pkt.samples_total = health.samples_total;
     pkt.samples_invalid = health.samples_invalid;
     pkt.i2c_recovery_count = health.i2c_recovery_count;
-    pkt.reserved[0] = 0;
+
+    // Notify Python app if sensor is in degraded mode. Uses reserved[0] as a
+    // degraded-mode signal (non-zero = degraded, non-static so safe for this use).
+    pkt.reserved[0] = isSensorDegraded() ? 1 : (isRecoveryInProgress() ? 2 : 0);
     pkt.reserved[1] = 0;
     pkt.reserved[2] = 0;
+
     sendPacket(PKT_TYPE_EVT_SENSOR_HEALTH, &pkt, sizeof(pkt));
 }
 

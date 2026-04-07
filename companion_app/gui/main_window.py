@@ -36,6 +36,7 @@ from gui.theme import (
     FG_DIM,
 )
 from gui.widgets.status_bar import StatusBar
+from stasys.core.imu_calibrator import IMUCalibrator
 from stasys.protocol.commands import cmd_get_info, cmd_start_session, cmd_stop_session
 from stasys.protocol.flow_control import FlowControl
 from PyQt6.QtWidgets import QCheckBox
@@ -69,6 +70,8 @@ class DataRouter(QObject):
     session_stopped = pyqtSignal(object)  # EvtSessionStopped
     info_received = pyqtSignal(object)    # RspInfo
     connection_changed = pyqtSignal(bool)  # connected bool
+    calibrating = pyqtSignal(bool)          # True = calibrating, False = done
+    calibration_progress = pyqtSignal(float)  # 0.0-1.0 progress
     session_start_failed = pyqtSignal()    # timeout — no EVT_SESSION_STARTED received
 
 
@@ -366,6 +369,10 @@ class MainWindow(QMainWindow):
         self._session_timeout_timer.setSingleShot(True)
         self._session_timeout_timer.timeout.connect(self._on_session_start_failed)
 
+        # IMU software calibration — triggered on New Session click
+        self._calibrator = IMUCalibrator()
+        self._calibration_mode = False  # True = collecting calibration samples
+
         # App settings (local-only, no firmware sync for MVP)
         self._settings = {
             "fire_mode": "Live Fire",
@@ -439,6 +446,7 @@ class MainWindow(QMainWindow):
         self._router.session_started.connect(self._on_session_started)
         self._router.session_stopped.connect(self._on_session_stopped)
         self._router.session_start_failed.connect(self._on_session_start_failed)
+        self._router.calibrating.connect(self._on_calibrating_done)
         self._router.info_received.connect(self._on_info)
         self._router.connection_changed.connect(self._on_connection_changed)
 
@@ -462,11 +470,11 @@ class MainWindow(QMainWindow):
                 status_callback=self._on_transport_status,
                 flow_control=None,  # FlowControl set up below after transport exists
             )
-            if not self._transport.connect(port):
-                self._status_bar.set_status(
-                    f"Cannot open {port} — is the STASYS device powered on and paired?",
-                    "error",
-                )
+            success, reason = self._transport.connect(port)
+            if not success:
+                # reason carries a diagnostic message from the transport layer.
+                msg = reason or f"Cannot open {port} — is the STASYS device powered on and paired?"
+                self._status_bar.set_status(msg, "error")
                 self._top_bar._connect_btn.setEnabled(True)
                 self._top_bar.port_input.setEnabled(True)
                 return
@@ -487,12 +495,112 @@ class MainWindow(QMainWindow):
         self._packet_thread = threading.Thread(target=self._packet_reader, daemon=True)
         self._packet_thread.start()
 
-        # Request device info
-        time.sleep(0.3)
+        # Request device info — the ESP32 only responds to commands, so we
+        # must NOT wait here. Instead, start a timeout. If RSP_INFO doesn't
+        # arrive within 5s, the ESP32 is offline even though the port opened.
+        #
+        # The reader thread handles draining stale ESP32 data automatically.
+        # We simply send the command and wait for RSP_INFO (with a 5s timeout).
         self._send_raw(cmd_get_info())
+        self._connection_timeout_timer = QTimer()
+        self._connection_timeout_timer.setSingleShot(True)
+        self._connection_timeout_timer.timeout.connect(self._on_connection_failed)
+        self._connection_timeout_timer.start(5000)  # 5-second connection verification timeout
+
+    def _drain_stale_then_wait_for_live(self) -> None:
+        """Drain stale ESP32 output from the receive queue, then wait for fresh data.
+
+        ESP32 sometimes sends a partial "AA" byte before the full "55 ..." packet
+        (separate serial reads). This is stale data from the previous session and
+        must be discarded. We drain with short timeouts to let all serial buffering
+        complete, then re-inject any complete frames (starting with 0xAA 0x55)
+        so the reader can process them normally.
+        """
+        from stasys.protocol.parser import ProtocolParser
+        stale_chunks = 0
+        live_bytes = b""
+        wait_count = 0
+        max_waits = 3  # ~3 seconds max to collect live data
+
+        # Drain all currently queued stale data (from before we were ready).
+        # Use short timeouts so we don't block the GUI thread.
+        while self._running:
+            try:
+                self._transport.read_queue.get(timeout=0.05)
+                stale_chunks += 1
+            except queue.Empty:
+                break
+
+        if stale_chunks > 0:
+            self._logger.debug("Drained %d stale chunk(s) from receive queue", stale_chunks)
+
+        # Wait for the ESP32's response to CMD_GET_INFO to arrive.
+        # The SerialTransport read thread puts data in the queue; we consume it here.
+        # Bound the wait so we don't block forever if ESP32 doesn't respond.
+        while self._running and wait_count < max_waits:
+            try:
+                chunk = self._transport.read_queue.get(timeout=1.0)
+                live_bytes += chunk
+                break  # got data — done waiting
+            except queue.Empty:
+                wait_count += 1
+
+        if live_bytes:
+            # Re-inject complete 0xAA 0x55 frames so the reader processes them.
+            # Discard incomplete "AA" prefix if the frame was split.
+            idx = live_bytes.find(b"\xaa\x55")
+            if idx >= 0:
+                complete = live_bytes[idx:]
+                self._logger.debug(
+                    "Re-injecting %d bytes of stale-complete frame: %s",
+                    len(complete), complete.hex(),
+                )
+                self._transport.read_queue.put(complete)
+            else:
+                self._logger.debug(
+                    "Stale response had no complete frame, discarding %d bytes: %s",
+                    len(live_bytes), live_bytes.hex(),
+                )
 
     def _packet_reader(self) -> None:
-        """Background thread: read from transport queue and feed parser."""
+        """Background thread: read from transport queue and feed parser.
+
+        On startup, drains any stale bytes from a previous session that arrived
+        before the parser was ready. ESP32 sometimes sends a partial "AA" byte
+        before the full "55 81..." packet (separate serial reads). These are
+        discarded. Any complete frames (0xAA 0x55 ...) found in stale data are
+        re-injected so the reader can process them normally.
+        """
+        # Drain stale ESP32 output that arrived before we were ready.
+        # Use a short timeout per drain iteration so we don't block indefinitely.
+        stale_chunks = 0
+        stale_complete_frames = b""
+        while self._running:
+            try:
+                chunk = self._transport.read_queue.get(timeout=0.05)
+                stale_chunks += 1
+                # Accumulate complete 0xAA 0x55 frames for re-injection.
+                # If the frame is split ("AA" + "55 81..."), accumulate both.
+                stale_complete_frames += chunk
+            except queue.Empty:
+                break
+
+        if stale_chunks > 0:
+            # Check if we accumulated a complete frame in the stale data.
+            idx = stale_complete_frames.find(b"\xaa\x55")
+            if idx >= 0:
+                complete = stale_complete_frames[idx:]
+                self._logger.debug(
+                    "Re-injecting %d-byte complete frame from stale drain: %s",
+                    len(complete), complete.hex(),
+                )
+                self._transport.read_queue.put(complete)
+            else:
+                self._logger.debug(
+                    "Discarded %d stale byte chunk(s) (no complete frame)", stale_chunks,
+                )
+
+        # Normal: read live data and feed the parser.
         while self._running:
             try:
                 data = self._transport.read_queue.get(timeout=0.5)
@@ -513,13 +621,50 @@ class MainWindow(QMainWindow):
     def _on_packet(self, packet: object) -> None:
         """Route packet to GUI via signals (thread-safe)."""
         if isinstance(packet, DataRawSample):
+            # Feed to calibrator if in calibration mode
+            if self._calibration_mode:
+                self._calibrator.feed(
+                    gyro_x=packet.gyro_x,
+                    gyro_y=packet.gyro_y,
+                    gyro_z=packet.gyro_z,
+                    accel_x=packet.accel_x,
+                    accel_y=packet.accel_y,
+                    accel_z=packet.accel_z,
+                )
+                progress = self._calibrator.progress
+                self._router.calibration_progress.emit(progress)
+                if self._calibrator.is_calibrated:
+                    # Calibration complete — switch to normal plotting
+                    self._calibration_mode = False
+                    self._router.calibrating.emit(False)
+                    self._logger.info(
+                        "IMU calibration complete: gyro_bias=(%.2f, %.2f, %.2f) deg/s  "
+                        "accel_bias=(%.1f, %.1f, %.1f) raw",
+                        self._calibrator.bias.gyro_x,
+                        self._calibrator.bias.gyro_y,
+                        self._calibrator.bias.gyro_z,
+                        self._calibrator.bias.accel_x,
+                        self._calibrator.bias.accel_y,
+                        self._calibrator.bias.accel_z,
+                    )
             self._router.sample_received.emit(packet)
         elif isinstance(packet, EvtShotDetected):
             self._router.shot_received.emit(packet)
         elif isinstance(packet, EvtSensorHealth):
             self._router.health_received.emit(packet)
+            # Check for firmware-side degraded mode (sensor permanently failed).
+            # degraded_flag: 0=healthy, 1=degraded (MPU failed), 2=recovery in progress.
+            if packet.degraded_flag == 1:
+                self._logger.warning(
+                    "ESP32 sensor permanently degraded (MPU6050 I2C failure). "
+                    "Raw data stream suppressed. Check physical connection."
+                )
         elif isinstance(packet, EvtSessionStarted):
+            # Session started — begin calibration mode
             self._router.session_started.emit(packet)
+            self._calibration_mode = True
+            self._calibrator.reset()
+            self._router.calibrating.emit(True)
         elif isinstance(packet, EvtSessionStopped):
             self._router.session_stopped.emit(packet)
         elif isinstance(packet, RspInfo):
@@ -539,6 +684,8 @@ class MainWindow(QMainWindow):
         self._running = False
         self._session_pending = False
         self._session_timeout_timer.stop()
+        if hasattr(self, "_connection_timeout_timer"):
+            self._connection_timeout_timer.stop()
         if self._transport:
             self._transport.disconnect()
             self._transport = None
@@ -553,6 +700,9 @@ class MainWindow(QMainWindow):
         self._tab_analysis.on_disconnect()
 
     def _on_info(self, info: RspInfo) -> None:
+        # Cancel connection verification timeout — ESP32 is confirmed connected.
+        if hasattr(self, "_connection_timeout_timer"):
+            self._connection_timeout_timer.stop()
         port = self._transport._port if self._transport else "?"
         version = info.firmware_version_str
         self._top_bar.set_connected(port, version)
@@ -607,6 +757,22 @@ class MainWindow(QMainWindow):
             firmware_session_id=evt.session_id,
             battery_start=evt.battery_percent,
         )
+
+    def _on_connection_failed(self) -> None:
+        """Called when RSP_INFO is not received within 5s of connecting.
+
+        This means the COM port opened successfully but the ESP32 is not
+        responding — it is either offline or out of BT range.
+        """
+        self._logger.warning(
+            "Connection verification timed out — COM port opened but ESP32 "
+            "is not responding. The device may be offline or out of BT range."
+        )
+        self._status_bar.set_status(
+            "COM port opened but ESP32 is not responding — "
+            "make sure STASYS is powered on and in BT range.", "error",
+        )
+        self._on_disconnect()
 
     def _on_session_start_failed(self) -> None:
         """Called when 5-second timeout fires with no EVT_SESSION_STARTED."""
@@ -670,6 +836,11 @@ class MainWindow(QMainWindow):
         self._settings["calibrated"] = True
         self._status_bar.set_status("IMU re-zeroed at current position", "success")
 
+    def _on_calibrating_done(self, calibrating: bool) -> None:
+        """Called when calibration completes (calibrating=False)."""
+        if not calibrating and self._session_active:
+            self._status_bar.set_status("Calibration complete — recording data...", "success")
+
     # ── Settings access ───────────────────────────────────────────────────────
 
     def get_settings(self) -> dict:
@@ -682,6 +853,14 @@ class MainWindow(QMainWindow):
 
     def is_zero_set(self) -> bool:
         return self._zero_set
+
+    def get_calibrator(self) -> IMUCalibrator:
+        """Return the IMU calibrator for use in tabs."""
+        return self._calibrator
+
+    def is_calibration_mode(self) -> bool:
+        """True while calibration is in progress."""
+        return self._calibration_mode
 
     # ── Close ─────────────────────────────────────────────────────────────────
 

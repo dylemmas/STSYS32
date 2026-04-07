@@ -163,14 +163,18 @@ class EvtSensorHealth:
         samples_total: Total sample read attempts.
         samples_invalid: Total invalid/malformed samples.
         i2c_recovery_count: Number of I2C bus recoveries performed.
-        dropped_samples: Samples dropped due to queue overflow (derived: samples_invalid).
+        degraded_flag: reserved[0] — 0=healthy, 1=degraded (MPU failed), 2=recovery in progress.
+        reserved1-3: reserved[1:4] — unused padding.
     """
     mpu_present: int
     i2c_errors: int
     samples_total: int
     samples_invalid: int
     i2c_recovery_count: int
-    dropped_samples: int = 0
+    degraded_flag: int = 0      # reserved[0]: 0=ok, 1=degraded, 2=recovering
+    reserved1: int = 0
+    reserved2: int = 0
+    reserved3: int = 0
 
 
 @dataclass

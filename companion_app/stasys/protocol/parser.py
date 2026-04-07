@@ -9,6 +9,10 @@ CRC-16/CCITT (seed=0xFFFF) covers TYPE + LEN + PAYLOAD.
 
 Debug logging: set PARSER_DEBUG = True (or call set_debug(True)) to log every
 parsed packet's type byte, payload length, and CRC validation result.
+
+Error recovery: after MAX_CONSECUTIVE_DISCARDS consecutive garbage bytes,
+the parser forces a full state reset to prevent getting stuck in a corrupt
+state from a BT SPP batch delivery error or physical disconnects.
 """
 
 from __future__ import annotations
@@ -39,11 +43,17 @@ logger = logging.getLogger(__name__)
 # Logs: type byte (hex), payload length, CRC pass/fail for every parsed packet.
 PARSER_DEBUG = True
 
+# After this many consecutive garbage bytes (bytes that don't advance parser
+# state), force a full state reset. Prevents the parser getting permanently
+# stuck when BT SPP delivers mangled frames or the device restarts mid-stream.
+MAX_CONSECUTIVE_DISCARDS = 1024
+
 
 def set_debug(enabled: bool) -> None:
     """Enable or disable parser debug logging."""
     global PARSER_DEBUG
     PARSER_DEBUG = enabled
+
 
 _SYNC = b"\xAA\x55"
 _HEADER_LEN = 2 + 1 + 2  # sync + type + len
@@ -85,6 +95,10 @@ class ProtocolParser:
     Scans an internal byte buffer for 0xAA 0x55 sync markers, validates
     CRC-16/CCITT checksums, and emits parsed packets via callback or the
     output queue.
+
+    Error recovery: if MAX_CONSECUTIVE_DISCARDS bytes are consumed without
+    advancing the parser state (e.g. BT drops or buffer overflow), the
+    parser forces a full reset and clears the buffer to resync.
     """
 
     def __init__(
@@ -95,6 +109,9 @@ class ProtocolParser:
         self._callback = packet_callback
         self._packet_queue: queue.Queue[object] = queue.Queue()
 
+        # Error recovery state
+        self._consecutive_discards: int = 0
+
     @property
     def packet_queue(self) -> queue.Queue[object]:
         """Queue of parsed packet objects."""
@@ -104,6 +121,12 @@ class ProtocolParser:
         """Feed raw bytes into the parser. Incomplete frames are buffered."""
         self._buf.extend(data)
         self._dispatch()
+
+    def _force_reset(self, reason: str) -> None:
+        """Force a full parser state reset. Called after severe corruption."""
+        logger.warning("Parser forced reset: %s (buf cleared, %d bytes discarded)", reason, len(self._buf))
+        self._buf.clear()
+        self._consecutive_discards = 0
 
     def _dispatch(self) -> None:
         """Main parsing loop — runs until buffer is exhausted or incomplete."""
@@ -125,20 +148,28 @@ class ProtocolParser:
         # Phase 1: scan for sync
         sync_pos = bytes(self._buf).find(_SYNC)
         if sync_pos < 0:
-            # Sync not found. If buffer is too short to contain a possible sync
-            # (fewer than 2 bytes), just wait for more data. Don't discard.
-            if len(self._buf) < len(_SYNC):
-                return 0
-            # Buffer has ≥2 bytes but no sync → discard all and return 0.
-            if len(self._buf) > 0:
-                self._log_hex(f"No sync found, discarding {len(self._buf)} bytes", bytes(self._buf[:16]))
+            # Sync not found. Track consecutive discards for error recovery.
+            discarded = len(self._buf)
+            self._consecutive_discards += discarded
+
+            if self._consecutive_discards >= MAX_CONSECUTIVE_DISCARDS:
+                self._force_reset(f"too many discards ({self._consecutive_discards} bytes, no sync found)")
+            elif discarded > 0:
+                self._log_hex(f"No sync found, discarding {discarded} bytes", bytes(self._buf[:min(discarded, 16)]))
             self._buf.clear()
             return 0
 
         if sync_pos > 0:
-            self._log_hex(f"Discarding {sync_pos} garbage byte(s) before sync", bytes(self._buf[:sync_pos]))
+            self._consecutive_discards += sync_pos
+            if self._consecutive_discards >= MAX_CONSECUTIVE_DISCARDS:
+                self._force_reset(f"too many discards ({self._consecutive_discards} bytes before sync)")
+                return 0
+            self._log_hex(f"Discarding {sync_pos} garbage byte(s) before sync", bytes(self._buf[:min(sync_pos, 16)]))
             del self._buf[:sync_pos]
             return -1
+
+        # Sync found — reset discard counter on each confirmed sync
+        self._consecutive_discards = 0
 
         # Phase 2: check minimum header length
         if len(self._buf) < _HEADER_LEN:
@@ -150,7 +181,14 @@ class ProtocolParser:
 
         # Phase 4: sanity-check declared length
         if payload_len > _MAX_PAYLOAD:
-            self._log_hex(f"Length {payload_len} exceeds max {_MAX_PAYLOAD}; discarding 1 byte", bytes(self._buf[:1]))
+            self._log_hex(
+                f"Length {payload_len} exceeds max {_MAX_PAYLOAD}; discarding header byte",
+                bytes(self._buf[:min(1, len(self._buf))]),
+            )
+            self._consecutive_discards += 1
+            if self._consecutive_discards >= MAX_CONSECUTIVE_DISCARDS:
+                self._force_reset(f"payload length overflow ({payload_len} > {_MAX_PAYLOAD})")
+                return 0
             del self._buf[:1]
             return -1
 
@@ -167,12 +205,19 @@ class ProtocolParser:
         # Phase 7: CRC validation over TYPE + LEN + PAYLOAD
         computed_crc = crc16(bytes(self._buf[2:frame_end]))
         if computed_crc != received_crc:
+            self._consecutive_discards += 1
+            if self._consecutive_discards >= MAX_CONSECUTIVE_DISCARDS:
+                self._force_reset(f"CRC mismatch after {self._consecutive_discards} discards")
+                return 0
             self._log_hex(
                 f"CRC mismatch: got 0x{received_crc:04X}, computed 0x{computed_crc:04X}; discarding header",
                 bytes(self._buf[:min(total_len, 32)]),
             )
             del self._buf[:_HEADER_LEN]
             return -1
+
+        # CRC valid — reset discard counter
+        self._consecutive_discards = 0
 
         # Phase 8: parse typed packet
         try:
@@ -251,6 +296,7 @@ class ProtocolParser:
             elif packet_type == PacketType.EVT_SENSOR_HEALTH:
                 # 11 bytes: mpu_present(1) + i2c_errors(1) + samples_total(2) + samples_invalid(2)
                 #           + i2c_recovery_count(1) + reserved(4)
+                # reserved[0] is used as degraded-mode signal (1=degraded, 2=recovery in progress)
                 if len(payload) < 11:
                     raise ValueError(f"EVT_SENSOR_HEALTH: expected 8+ bytes, got {len(payload)}")
                 d = payload[:11]
@@ -260,6 +306,10 @@ class ProtocolParser:
                     samples_total=int.from_bytes(d[2:4], "little"),
                     samples_invalid=int.from_bytes(d[4:6], "little"),
                     i2c_recovery_count=d[6],
+                    degraded_flag=d[7] if len(d) > 7 else 0,
+                    reserved1=d[8] if len(d) > 8 else 0,
+                    reserved2=d[9] if len(d) > 9 else 0,
+                    reserved3=d[10] if len(d) > 10 else 0,
                 )
 
             elif packet_type == PacketType.DATA_RAW_SAMPLE:
@@ -343,3 +393,13 @@ class ProtocolParser:
         """Log a hex dump."""
         hex_str = " ".join(f"{b:02X}" for b in data)
         logger.warning("%s: [%s]", msg, hex_str)
+
+    def reset(self) -> None:
+        """Manually reset parser state and clear buffer.
+
+        Use this when the Python app knows the ESP32 has restarted or
+        the BT link was reset, to ensure the parser starts from a clean state.
+        """
+        self._buf.clear()
+        self._consecutive_discards = 0
+        logger.info("Parser state reset by application")

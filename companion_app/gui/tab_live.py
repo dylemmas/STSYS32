@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -18,11 +19,127 @@ from PyQt6.QtWidgets import (
 from gui.main_window import DataRouter, MainWindow
 from gui.theme import (
     BG2,
+    BG3,
     FG_DIM,
     ORANGE,
 )
 from gui.widgets.score_gauge import ScoreGauge
 from stasys.protocol.packets import DataRawSample, EvtShotDetected
+
+
+class _CalibrationOverlay(QWidget):
+    """Full-panel overlay shown during IMU calibration."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        # Cover the entire parent
+        self.setGeometry(parent.rect())
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setStyleSheet(
+            "background: rgba(13, 13, 13, 0.88); border-radius: 4px;"
+        )
+        self.hide()
+
+        vlayout = QVBoxLayout(self)
+        vlayout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vlayout.setSpacing(12)
+
+        # Icon
+        icon_lbl = QLabel("◉")
+        icon_lbl.setStyleSheet(
+            "color: #00ff88; font-size: 48px; background: transparent;"
+        )
+        vlayout.addWidget(icon_lbl)
+
+        # Title
+        title = QLabel("CALIBRATING")
+        title.setStyleSheet(
+            "color: #00ff88; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 22px; font-weight: bold; letter-spacing: 4px; "
+            "background: transparent;"
+        )
+        vlayout.addWidget(title)
+
+        # Instruction
+        self._instruction = QLabel("Keep the device still...")
+        self._instruction.setStyleSheet(
+            "color: #888; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 13px; background: transparent;"
+        )
+        vlayout.addWidget(self._instruction)
+
+        # Progress bar
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 1000)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFixedWidth(300)
+        self._progress_bar.setFormat("")
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background: #2a2a2a; border: none; border-radius: 4px; "
+            "height: 10px; } "
+            "QProgressBar::chunk { background: #00ff88; border-radius: 4px; }"
+        )
+        vlayout.addWidget(self._progress_bar)
+
+        # Progress label
+        self._progress_label = QLabel("0 / 500 samples")
+        self._progress_label.setStyleSheet(
+            "color: #555; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 11px; background: transparent;"
+        )
+        vlayout.addWidget(self._progress_label)
+
+        vlayout.addSpacing(20)
+
+        # Static indicator
+        self._static_indicator = QLabel("◎ Checking motion...")
+        self._static_indicator.setStyleSheet(
+            "color: #888; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 12px; background: transparent;"
+        )
+        vlayout.addWidget(self._static_indicator)
+
+        # Skip button
+        self._skip_btn = QPushButton("Skip Calibration")
+        self._skip_btn.setStyleSheet(
+            "background: transparent; color: #555; border: 1px solid #333; "
+            "border-radius: 3px; padding: 6px 20px; font-family: 'JetBrains Mono', monospace; "
+            "font-size: 11px; letter-spacing: 1px;"
+        )
+        vlayout.addWidget(self._skip_btn)
+
+    def set_progress(self, progress: float, count: int, total: int) -> None:
+        self._progress_bar.setValue(int(progress * 1000))
+        self._progress_label.setText(f"{count} / {total} samples")
+
+    def set_static_status(self, is_static: bool) -> None:
+        if is_static:
+            self._static_indicator.setText("◉ Device is steady")
+            self._static_indicator.setStyleSheet(
+                "color: #00ff88; font-family: 'JetBrains Mono', monospace; "
+                "font-size: 12px; background: transparent;"
+            )
+            self._instruction.setText("Keep the device still...")
+        else:
+            self._static_indicator.setText("◎ Motion detected — hold steady")
+            self._static_indicator.setStyleSheet(
+                "color: #ff6600; font-family: 'JetBrains Mono', monospace; "
+                "font-size: 12px; background: transparent;"
+            )
+            self._instruction.setText("⚠ Motion detected! Hold still...")
+
+    def show_calibrating(self, show: bool) -> None:
+        if show:
+            # Size overlay to match PlotWidget before showing
+            pw = self.parent().findChild(pg.PlotWidget) if self.parent() else None
+            if pw:
+                self.setGeometry(pw.rect())
+            else:
+                self.setGeometry(self.parent().rect() if self.parent() else self.rect())
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
 
 
 class LiveTab(QWidget):
@@ -66,6 +183,14 @@ class LiveTab(QWidget):
         self._jerk_mag = 0.0
         self._phase = "—"
 
+        # Dot goes out of range — implement auto-scrolling so the view follows
+        # the current position. We track the rolling min/max of disp_x/y and
+        # keep the current position near the center with a ±3° padding margin.
+        self._disp_min_x: float = 0.0
+        self._disp_max_x: float = 0.0
+        self._disp_min_y: float = 0.0
+        self._disp_max_y: float = 0.0
+
         # Score
         self._last_score = 0.0
         self._last_displacement = 0.0
@@ -88,8 +213,13 @@ class LiveTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left: trace plot
-        self._plot_widget = self._build_trace_plot()
-        splitter.addWidget(self._plot_widget)
+        self._plot_container = self._build_trace_plot()
+        splitter.addWidget(self._plot_container)
+
+        # Calibration overlay (positioned inside plot container on top of plot)
+        self._calibration_overlay = _CalibrationOverlay(self._plot_container)
+        # Ensure overlay stays on top when plot container resizes
+        self._plot_container.resizeEvent = self._plot_container_resize
 
         # Right: stats panel
         right_panel = self._build_stats_panel()
@@ -325,6 +455,72 @@ class LiveTab(QWidget):
     def _connect_signals(self) -> None:
         self._router.sample_received.connect(self._on_sample)
         self._router.shot_received.connect(self._on_shot)
+        self._router.calibrating.connect(self._on_calibrating)
+        self._router.calibration_progress.connect(self._on_calibration_progress)
+
+        # Skip button inside calibration overlay
+        self._calibration_overlay._skip_btn.clicked.connect(self._on_skip_calibration)
+
+    def _plot_container_resize(self, event) -> None:
+        """Resize calibration overlay to match plot widget inside container."""
+        # First call the original resize
+        QWidget.resizeEvent(self._plot_container, event)
+        # Then resize overlay to match the PlotWidget inside
+        pw = self._plot_container.findChild(pg.PlotWidget)
+        if pw and self._calibration_overlay:
+            self._calibration_overlay.setGeometry(pw.rect())
+
+    def _on_calibrating(self, calibrating: bool) -> None:
+        """Show/hide calibration overlay and reset plot on calibration state change."""
+        if calibrating:
+            # Reset angle integration for fresh calibration
+            self._prev_timestamp_us = None
+            self._bias_captured = False
+            self._trace_x.clear()
+            self._trace_y.clear()
+            self._timestamps.clear()
+            self._wobble_window.clear()
+            self._angle_x = 0.0
+            self._angle_y = 0.0
+            self._hold_start_time = 0.0
+            self._stable_since = 0.0
+            # Reset auto-scroll tracking
+            self._disp_min_x = 0.0
+            self._disp_max_x = 0.0
+            self._disp_min_y = 0.0
+            self._disp_max_y = 0.0
+            # Reset plot view to center (0,0) with ±4° range
+            self._pw.setXRange(-4, 4, padding=0)
+            self._pw.setYRange(-4, 4, padding=0)
+            self._calibration_overlay.show_calibrating(True)
+        else:
+            self._calibration_overlay.show_calibrating(False)
+
+    def _on_calibration_progress(self, progress: float) -> None:
+        """Update calibration overlay with current progress and static status."""
+        calibrator = self._mw.get_calibrator()
+        count = calibrator.sample_count
+        total = calibrator.calibration_target
+        self._calibration_overlay.set_progress(progress, count, total)
+        self._calibration_overlay.set_static_status(calibrator.is_static)
+
+    def _on_skip_calibration(self) -> None:
+        """User pressed Skip — complete calibration with current samples."""
+        calibrator = self._mw.get_calibrator()
+        if not calibrator.is_calibrated and calibrator.sample_count > 0:
+            # Commit partial calibration with what we have
+            n = float(calibrator.sample_count)
+            from stasys.core.imu_calibrator import CalibrationBias
+            calibrator._bias = CalibrationBias(
+                gyro_x=calibrator._gyro_x_sum / n,
+                gyro_y=calibrator._gyro_y_sum / n,
+                gyro_z=calibrator._gyro_z_sum / n,
+                accel_x=calibrator._accel_x_sum / n,
+                accel_y=calibrator._accel_y_sum / n,
+                accel_z=calibrator._accel_z_sum / n,
+            )
+            calibrator._is_calibrated = True
+        self._router.calibrating.emit(False)
 
     # ── Packet handlers ───────────────────────────────────────────────────────
 
@@ -352,19 +548,40 @@ class LiveTab(QWidget):
             dt = 0.01  # seed dt on first sample
         self._prev_timestamp_us = sample.timestamp_us
 
-        gyro_x_dps = sample.gyro_x / 65.5
-        gyro_y_dps = sample.gyro_y / 65.5
+        calibrator = self._mw.get_calibrator()
 
-        # Capture gyro bias on first sample — raw gyro zero-drift causes huge
-        # angle drift if uncorrected. Bias is re-captured on re-zero.
-        if not self._bias_captured:
-            self._gyro_bias_x = gyro_x_dps
-            self._gyro_bias_y = gyro_y_dps
-            self._bias_captured = True
+        # ── Bias-corrected gyro for integration ─────────────────────────────
+        # Two paths:
+        #   - Calibrated: subtract calibrator's mean bias from raw gyro,
+        #     then integrate (one correction only, no double-subtraction)
+        #   - Not calibrated: capture first-sample gyro as session bias,
+        #     then subtract it each subsequent sample
+        raw_gyro_x = sample.gyro_x
+        raw_gyro_y = sample.gyro_y
 
-        # Integrate gyro with bias correction
-        self._angle_x += (gyro_x_dps - self._gyro_bias_x) * dt
-        self._angle_y += (gyro_y_dps - self._gyro_bias_y) * dt
+        if calibrator.is_calibrated:
+            # Use calibrator's pre-computed bias directly in integration.
+            # No per-session bias capture — calibrator owns this.
+            if not self._bias_captured:
+                self._gyro_bias_x = calibrator.bias.gyro_x
+                self._gyro_bias_y = calibrator.bias.gyro_y
+                self._bias_captured = True
+            gyro_x_dps = (raw_gyro_x - self._gyro_bias_x) / 65.5
+            gyro_y_dps = (raw_gyro_y - self._gyro_bias_y) / 65.5
+        else:
+            # Not yet calibrated — capture first sample as session bias.
+            if not self._bias_captured:
+                self._gyro_bias_x = raw_gyro_x
+                self._gyro_bias_y = raw_gyro_y
+                self._bias_captured = True
+            gyro_x_dps = (raw_gyro_x - self._gyro_bias_x) / 65.5
+            gyro_y_dps = (raw_gyro_y - self._gyro_bias_y) / 65.5
+
+        # Integrate bias-corrected gyro: gyro_x_dps is already bias-corrected
+        # (raw minus calibrator or first-sample bias, divided by 65.5).
+        # Do NOT subtract _gyro_bias_x again here — that's the double-subtraction bug.
+        self._angle_x += gyro_x_dps * dt
+        self._angle_y += gyro_y_dps * dt
 
         # Apply zero offset (RE-ZERO baseline)
         offset_x, offset_y = self._mw.get_zero_offset()
@@ -379,19 +596,44 @@ class LiveTab(QWidget):
         self._trace_y.append(disp_y)
         self._timestamps.append(sample.timestamp_us / 1_000_000.0)
 
-        # Compute jerk magnitude
-        accel_x = sample.accel_x / 8192.0 * 9.81
-        jerk_x = accel_x / dt if dt > 0 else 0
+        # Compute jerk magnitude (use raw accel here as it's not critical for calibration)
+        accel_x_raw = sample.accel_x
+        jerk_x = accel_x_raw / 8192.0 * 9.81 / dt if dt > 0 else 0
         self._jerk_mag = abs(jerk_x)
 
-        # Steadiness metrics (bias-corrected gyro for wobble)
-        gyro_mag = ((gyro_x_dps - self._gyro_bias_x) ** 2 +
-                    (gyro_y_dps - self._gyro_bias_y) ** 2) ** 0.5
+        # Steadiness metrics — gyro_x_dps is already bias-corrected,
+        # so use it directly (no further subtraction needed).
+        gyro_mag = (gyro_x_dps ** 2 + gyro_y_dps ** 2) ** 0.5
         self._wobble_window.append(gyro_mag)
         self._wobble_rms = (
             sum(v ** 2 for v in self._wobble_window) / len(self._wobble_window)
         ) ** 0.5
         self._npa_deviation = (disp_x ** 2 + disp_y ** 2) ** 0.5
+
+        # Auto-scroll: keep current position centered with ±3° padding.
+        # If the dot reaches within 1° of any edge, shift the view window.
+        MARGIN = 1.0        # degrees — trigger scroll when within this of edge
+        PADDING = 3.0       # degrees — new view padding around the position
+        center_x = disp_x
+        center_y = disp_y
+        x_range = self._pw.viewRange()[0]
+        y_range = self._pw.viewRange()[1]
+        x_lo, x_hi = x_range
+        y_lo, y_hi = y_range
+
+        needs_scroll = (
+            center_x < x_lo + MARGIN or
+            center_x > x_hi - MARGIN or
+            center_y < y_lo + MARGIN or
+            center_y > y_hi - MARGIN
+        )
+        if needs_scroll:
+            # Re-center the view on the current dot, with ±PADDING° range
+            self._pw.setXRange(center_x - PADDING, center_x + PADDING, padding=0)
+            self._pw.setYRange(center_y - PADDING, center_y + PADDING, padding=0)
+            # After re-centering, reset trailing curves so they re-draw in the new coordinate space
+            self._trace_x.clear()
+            self._trace_y.clear()
 
         # Phase detection
         jerk_threshold = self._mw.get_settings().get("jerk_threshold", 5.0) * 9.81

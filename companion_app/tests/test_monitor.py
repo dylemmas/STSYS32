@@ -102,9 +102,13 @@ class TestSerialTransport:
         with patch("serial.Serial", return_value=mock_ser):
             from stasys.transport.serial_transport import SerialTransport
             t = SerialTransport(port="COM5")
-            result = t.connect()
-            assert result is True
-            assert t.is_connected
+            with patch.object(
+                SerialTransport, "_wait_for_data", return_value=True,
+            ):
+                success, reason = t.connect()
+                assert success is True
+                assert reason is None
+                assert t.is_connected
 
     def test_write_when_disconnected_returns_minus_one(self) -> None:
         from stasys.transport.serial_transport import SerialTransport

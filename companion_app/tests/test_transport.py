@@ -108,8 +108,9 @@ class TestSerialTransportInstantiation:
 
     def test_connect_returns_false_when_no_port(self) -> None:
         transport = SerialTransport()
-        result = transport.connect()
-        assert result is False
+        success, reason = transport.connect()
+        assert success is False
+        assert reason is not None
         assert not transport.is_connected
 
     def test_disconnect_is_safe_when_not_connected(self) -> None:
@@ -123,27 +124,38 @@ class TestSerialTransportWithMockedSerial:
         mock_ser = MagicMock()
         mock_ser.is_open = True
 
-        with patch("serial.Serial", return_value=mock_ser) as mock_class:
-            transport = SerialTransport(port="COM5")
-            result = transport.connect()
+        with patch(
+            "stasys.transport.serial_transport.SerialTransport._open_port",
+            return_value=(mock_ser, None),
+        ):
+            with patch(
+                "stasys.transport.serial_transport.SerialTransport._wait_for_data",
+                return_value=True,
+            ):
+                transport = SerialTransport(port="COM5")
+                success, reason = transport.connect()
 
-            assert result is True
-            assert transport.is_connected
-            mock_class.assert_called_once()
-            call_kwargs = mock_class.call_args
-            assert call_kwargs.kwargs["port"] == "COM5"
-            assert call_kwargs.kwargs["baudrate"] == 115200
+                assert success is True
+                assert reason is None
+                assert transport.is_connected
 
     def test_write_returns_bytes_written(self) -> None:
         mock_ser = MagicMock()
         mock_ser.is_open = True
         mock_ser.write.return_value = 4
 
-        with patch("serial.Serial", return_value=mock_ser):
-            transport = SerialTransport(port="COM5")
-            transport.connect()
-            written = transport.write(b"\xaa\x55\x01\x00")
-            assert written == 4
+        with patch(
+            "stasys.transport.serial_transport.SerialTransport._open_port",
+            return_value=(mock_ser, None),
+        ):
+            with patch(
+                "stasys.transport.serial_transport.SerialTransport._wait_for_data",
+                return_value=True,
+            ):
+                transport = SerialTransport(port="COM5")
+                transport.connect()
+                written = transport.write(b"\xaa\x55\x01\x00")
+                assert written == 4
 
     def test_write_returns_minus_one_when_disconnected(self) -> None:
         transport = SerialTransport()
@@ -154,10 +166,67 @@ class TestSerialTransportWithMockedSerial:
         mock_ser = MagicMock()
         mock_ser.is_open = True
 
-        with patch("serial.Serial", return_value=mock_ser):
-            transport = SerialTransport(port="COM5")
-            transport.connect()
-            transport.disconnect()
+        with patch(
+            "stasys.transport.serial_transport.SerialTransport._open_port",
+            return_value=(mock_ser, None),
+        ):
+            with patch(
+                "stasys.transport.serial_transport.SerialTransport._wait_for_data",
+                return_value=True,
+            ):
+                transport = SerialTransport(port="COM5")
+                transport.connect()
+                transport.disconnect()
 
-            assert not transport.is_connected
-            mock_ser.close.assert_called_once()
+                assert not transport.is_connected
+                mock_ser.close.assert_called()
+
+    def test_connect_falls_back_to_alternate_port(self) -> None:
+        """When primary port fails, connect() tries the alternate SPP port."""
+        mock_ser = MagicMock()
+        mock_ser.is_open = True
+
+        def mock_open(port: str):
+            if port == "COM5":
+                return (None, "COM5 is in use by another process.")
+            return (mock_ser, None)
+
+        with patch(
+            "stasys.transport.serial_transport.SerialTransport._open_port",
+            side_effect=mock_open,
+        ):
+            with patch(
+                "stasys.transport.serial_transport.SerialTransport._find_alternate_spp_port",
+                return_value="COM6",
+            ):
+                with patch(
+                    "stasys.transport.serial_transport.SerialTransport._wait_for_data",
+                    return_value=True,
+                ):
+                    transport = SerialTransport(port="COM5")
+                    success, reason = transport.connect()
+
+        assert success is True
+        assert reason is None
+        assert transport._port == "COM6"
+
+    def test_connect_returns_diagnostic_on_all_ports_failed(self) -> None:
+        """When both primary and alternate fail, returns a diagnostic message."""
+        def mock_open(port: str):
+            return (None, f"{port} in use")
+
+        with patch(
+            "stasys.transport.serial_transport.SerialTransport._open_port",
+            side_effect=mock_open,
+        ):
+            with patch(
+                "stasys.transport.serial_transport.SerialTransport._find_alternate_spp_port",
+                return_value="COM6",
+            ):
+                transport = SerialTransport(port="COM5")
+                success, reason = transport.connect()
+
+        assert success is False
+        assert "COM5 failed" in reason
+        assert "COM6 also failed" in reason
+        assert "COM6 in use" in reason

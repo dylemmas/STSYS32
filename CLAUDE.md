@@ -2,7 +2,7 @@
 
 > **IMPORTANT: CLAUDE.md Maintenance Rule**
 > Any time a file within this project is modified (firmware source, companion app, scripts, config, protocol, etc.), CLAUDE.md must be reviewed and updated to reflect the change before committing.
-> Specifically: if you modify `src/protocol.h`, `src/protocol.cpp`, `src/bluetooth.cpp`, `src/bluetooth.h`, `src/config.h`, `src/session.h`, `src/sensor.h`, `src/shot_detector.h`, `src/led.h`, `src/battery.h`, `src/storage.h`, `src/ota.h`, `src/security.h`, `src/coredump.h`, `src/main.cpp`, `platformio.ini`, `partitions_ota.csv`, or any file in `companion_app/stasys/protocol/`, `companion_app/stasys/transport/`, `companion_app/stasys/storage/`, `companion_app/gui/`, or `companion_app/tools/`, check whether CLAUDE.md needs updating and update it in the same commit.
+> Specifically: if you modify `src/protocol.h`, `src/protocol.cpp`, `src/bluetooth.cpp`, `src/bluetooth.h`, `src/config.h`, `src/session.h`, `src/sensor.h`, `src/shot_detector.h`, `src/led.h`, `src/battery.h`, `src/storage.h`, `src/ota.h`, `src/security.h`, `src/coredump.h`, `src/main.cpp`, `platformio.ini`, `partitions_ota.csv`, or any file in `companion_app/stasys/protocol/`, `companion_app/stasys/transport/`, `companion_app/stasys/storage/`, `companion_app/stasys/core/`, `companion_app/gui/`, or `companion_app/tools/`, check whether CLAUDE.md needs updating and update it in the same commit.
 
 ## Git Workflow
 
@@ -292,9 +292,50 @@ CRC computed over (IV + CIPHERTEXT + TAG)
 - **Interrupt**: MPU6050 INT pin (GPIO4) triggers FreeRTOS binary semaphore
 - **Piezo**: ADC1_CH7 (GPIO35), raw 12-bit ADC (0-4095)
 - **I2C recovery**: RecoveryTask on Core 1 signals async recovery after 5 consecutive errors
-- **Degraded mode**: If MPU6050 fails 5 consecutive reads, enters degraded mode (suppresses streaming)
+- **Degraded mode**: If MPU6050 fails 5 consecutive reads and recovery task fails, enters degraded mode (suppresses streaming). `g_sensorDegraded` is cleared by `RecoveryTask` via semaphore signaling upon successful reinit. `sendSensorHealthPacket()` encodes degraded state in `reserved[0]` (0=ok, 1=degraded, 2=recovery in progress).
 - **I2C scan**: Diagnostic scan prints all responding I2C addresses on boot
 - **Calibration**: Bias subtraction applied per sample (factory + user); temperature compensation for gyro
+- **Recovery signal**: `recoveryDoneSem` semaphore notifies `sensorTask` of recovery completion so `g_sensorDegraded` is updated synchronously with sensor reads (not only on successful read). RecoveryTask resets `s_consecutiveErrors` and `s_recoveryFailCount` on success/failure respectively.
+
+### Companion App IMU Software Calibration
+
+The Python companion app performs automatic IMU calibration on every "New Session":
+
+1. **Trigger**: User clicks "New Session" → `CMD_START_SESSION` sent → `EVT_SESSION_STARTED` received
+2. **Collection**: 500 raw samples fed to `IMUCalibrator` (`stasys/core/imu_calibrator.py`) from the `DATA_RAW_SAMPLE` stream
+3. **Static detection**: Rolling 50-sample window of accelerometer magnitude; std dev < 0.1 m/s² = static. Motion resets accumulation.
+4. **Bias computation**: Mean of collected samples → gyro bias (deg/s) and accel bias (raw counts). Ported from C++ ROS reference logic (`detectStaticState` + `performCalibration`).
+5. **Application**: `calibrator.apply_bias()` called in `tab_live.py._on_sample()` for every sample after calibration completes
+6. **UI overlay**: `_CalibrationOverlay` widget on the Live tab shows progress bar, sample count, and static status indicator
+7. **Skip option**: "Skip Calibration" button commits partial bias if ≥1 sample collected
+
+**Key classes**: `IMUCalibrator` (`stasys/core/imu_calibrator.py`), `CalibrationBias` dataclass, `_CalibrationOverlay` widget (`gui/tab_live.py`). `DataRouter` signals: `calibrating(bool)`, `calibration_progress(float)`.
+
+### Companion App Error Recovery
+
+The Python app implements multi-layer error recovery:
+
+1. **Transport thread resilience** (`serial_transport.py`):
+   - Read loop catches `SerialException`, `OSError`, and all unexpected exceptions — thread never silently dies
+   - After 5 consecutive errors, forces reconnection attempt (clears port, reopens, drains stale queue)
+   - Empty reads (timeout) are not treated as errors — only actual exceptions increment the counter
+   - `_drain_queue()` called on every disconnect/reconnect to prevent stale bytes from corrupting the parser
+   - Exponential back-off on reconnect (3s → 30s max) prevents tight retry loops
+   - Permission denied on first open attempt: sleeps 1s and retries once
+
+2. **Parser crash protection** (`parser.py`):
+   - `MAX_CONSECUTIVE_DISCARDS = 1024`: if 1024 bytes are consumed without advancing parser state (no sync found, no valid frame), forces a full state reset and clears the buffer
+   - Resets `_consecutive_discards` to 0 at each confirmed `0xAA 0x55` sync marker
+   - Increments counter on each garbage byte (no sync found, CRC mismatch, length overflow)
+   - `reset()` method allows application to manually reset parser state (used after ESP32 restart)
+   - `_force_reset()` logs the reason for diagnostics
+
+3. **Flow control** (`flow_control.py`):
+   - `FlowControl.handle_xon()` / `handle_xoff()` are wrapped in try/except — any error is logged but doesn't propagate
+   - XON/XOFF bytes (0x11/0x13) are intercepted in `_dispatch_read()` and split from protocol data before the parser sees them
+   - If `_running=False` during disconnect, the reconnect loop exits cleanly without hanging
+
+4. **Degraded mode notification**: `EVT_SENSOR_HEALTH.reserved[0]` carries `degraded_flag`: 0=ok, 1=degraded (MPU failed), 2=recovery in progress. `main_window.py._on_packet()` logs a warning when degraded mode is active.
 
 ## Data Analysis
 
@@ -372,7 +413,8 @@ companion_app/
 │   │   ├── conversions.py   # raw→m/s², deg/s, °C conversion
 │   │   ├── analysis.py      # Session metrics (split times, group size, scores)
 │   │   └── export.py        # JSON/CSV export
-│   └── core/                 # Core utilities (placeholder)
+│   └── core/                 # Core utilities
+│       └── imu_calibrator.py # IMU software calibration (static detection + bias calculation)
 ├── tools/
 │   ├── console.py           # Interactive device console (CLI)
 │   ├── monitor.py           # Live session monitor (CLI)
@@ -498,7 +540,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 6.5 | Battery Certification | IEC 62133 + UN 38.3 (pre-certified cells recommended) | TODO |
 | 6.6 | RoHS/REACH | EU environmental compliance, Prop 65 (CA) | TODO |
 | 6.7 | IP54 Rating | Conformal coating, gasket, Gore-Tex vent, IP54 test | TODO |
-| 6.8 | Enclosure Design | Parametric OpenSCAD model: base (Picatinny-integrated, 2-slot engagement) + lid + gasket. Files: `STASYS_enclosure.scad`, `enclosure_base.scad`, `enclosure_lid.scad`, `enclosure_BOM.md`. Hardware: M3×6mm CSK screws (4×), M3×16mm cross-bolt (1×), brass heat-set inserts (4×) | IN PROGRESS (see enclosure_BOM.md for assembly guide) |
+| 6.8 | Enclosure Design | Watch-style case (`MainCase watch esp 32.stl` 66×55×30mm, `Lid watch esp 32.stl` 53×55×13mm). Picatinny adapter bracket (`picatinny_adapter.scad`) bolts to 4 corner bosses on case bottom. Parametric OpenSCAD models: `ENCLOSURE/`. Hardware: M2×6mm screws (4×) for boss attachment, M3×16mm cross-bolt (1×) for rail | IN PROGRESS (see `ENCLOSURE/enclosure_BOM.md` + `ENCLOSURE/picatinny_adapter.scad`) |
 | 6.9 | Compliance Docs | Declaration of Conformity, test reports, user manual, SBOM, EULA | TODO |
 
 ### Implementation Order
