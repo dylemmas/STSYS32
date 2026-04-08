@@ -93,7 +93,7 @@ I2C Error → recoveryQueue → RecoveryTask → recoverI2CBus() → reinit MPU6
 | 0x02 | CMD_STOP_SESSION | empty | Stop recording session |
 | 0x03 | CMD_GET_INFO | empty | Get firmware/device info |
 | 0x04 | CMD_GET_CONFIG | empty | Get current configuration |
-| 0x05 | CMD_SET_CONFIG | 46 bytes | Set configuration |
+| 0x05 | CMD_SET_CONFIG | 50 bytes | Set configuration |
 | 0x06 | CMD_AUTH | 36 bytes | HMAC-SHA256 auth token response |
 | 0x0B | CMD_FACTORY_RESET | empty | Wipe NVS, reboot |
 | 0x0C | CMD_OTA_START | 4 bytes | Begin OTA update (total_size) |
@@ -120,17 +120,17 @@ I2C Error → recoveryQueue → RecoveryTask → recoverI2CBus() → reinit MPU6
 | 0x12 | EVT_SHOT_DETECTED | 29 bytes | Shot detected event |
 | 0x13 | EVT_SENSOR_HEALTH | 11 bytes | Periodic health report |
 | 0x14 | EVT_AUTH_CHALLENGE | 20 bytes | Auth challenge from server |
-| 0x20 | DATA_RAW_SAMPLE | 24 bytes | Continuous IMU+piezo stream |
+| 0x20 | DATA_RAW_SAMPLE | 26 bytes | Continuous IMU+piezo stream |
 | 0x80 | RSP_ERROR | 33 bytes | Error response |
 | 0x81 | RSP_INFO | 14 bytes | Device/firmware info |
-| 0x82 | RSP_CONFIG | 46 bytes | Current configuration |
+| 0x82 | RSP_CONFIG | 50 bytes | Current configuration |
 | 0x83 | RSP_ACK | 2 bytes | Generic acknowledgement |
-| 0x84 | RSP_OTA_STATUS | 9 bytes | OTA progress response |
+| 0x84 | RSP_OTA_STATUS | 10 bytes | OTA progress response |
 | 0xF0 | PKT_TYPE_ENCRYPTED | var | AES-128-CCM encrypted wrapper |
 
 ### Payload Structures
 
-**CMD_SET_CONFIG / RSP_CONFIG (46 bytes)**:
+**CMD_SET_CONFIG / RSP_CONFIG (50 bytes)**:
 ```
 sample_rate_hz: 1 byte       (50, 100, or 200)
 piezo_threshold: 2 bytes     (default: 800)
@@ -140,7 +140,7 @@ led_enabled: 1 byte          (0=off, 1=on)
 data_mode: 1 byte            (0=both, 1=raw-only, 2=events-only)
 streaming_rate_hz: 2 bytes   (default: 100)
 device_name: 20 bytes       (BT device name)
-reserved: 15 bytes
+reserved: 19 bytes
 ```
 
 **CMD_AUTH (36 bytes)**:
@@ -183,10 +183,10 @@ i2c_recovery_count: 1 byte
 reserved: 4 bytes
 ```
 
-**RSP_OTA_STATUS (9 bytes)**:
+**RSP_OTA_STATUS (10 bytes)**:
 ```
 state: 1 byte              (0=IDLE,1=RECEIVING,2=VERIFYING,3=COMPLETE,4=ERROR)
-reserved: 1 byte
+reserved: 2 bytes
 bytes_received: 4 bytes
 total_expected: 4 bytes
 ```
@@ -207,7 +207,7 @@ recoil_axis: 1 byte           (0=X, 1=Y, 2=Z)
 recoil_sign: 1 byte           (+1 or -1)
 ```
 
-**DATA_RAW_SAMPLE (24 bytes)**:
+**DATA_RAW_SAMPLE (26 bytes)**:
 ```
 sample_counter: 4 bytes         (incrementing sample index)
 timestamp_us: 4 bytes          (microseconds since session start)
@@ -448,9 +448,8 @@ python tools/loopback_test.py     # Protocol round-trip test over mock serial
 - The firmware uses CRC-16/CCITT (seed=0xFFFF). Verify CRC on received packets; discard corrupted ones. The companion app's parser does this automatically.
 - **Parser debug logging**: `PARSER_DEBUG = True` by default. Logs every parsed packet's type byte (hex), name, and CRC result at DEBUG level. CRC failures are always logged regardless of the flag. Toggle with `parser.set_debug(True/False)`.
 - Data mode `0` (both) streams raw samples + sends shot events. Use `2` (events-only) for lowest bandwidth usage.
-- **Adaptive thresholds**: After 5 shots, the detector computes mean + 2*stddev of piezo peaks and self-tunes. Threshold suggestions are printed on session stop.
-- **Stale session guard**: If the ESP32 has an active session from a prior connection (e.g. BT dropout without clean disconnect), `handleStartSession` calls `stopSession()` first before starting a fresh session with a new ID. This prevents `EVT_SESSION_STARTED` timeouts in the companion app.
-- **Session start timeout**: 5 seconds (bumped from 3s). Windows Bluetooth SPP (bthmodem.sys) batches small packets, which can delay `EVT_SESSION_STARTED` (8 bytes) by 50–100ms. The timeout accommodates stale session guard overhead (SPIFFS write) plus SPP batching.
+- **Adaptive thresholds**: After 5 shots, the detector computes mean + 2*stddev of piezo peaks and self-tunes (live detection threshold). Threshold suggestions printed on session stop use mean - 0.5*stddev instead.
+- **Stale session guard**: When `REQUIRE_AUTH` is enabled, `handleStartSession` checks for an active session from a prior connection (e.g. BT dropout without clean disconnect) and calls `stopSession()` first before starting a fresh session with a new ID. When auth is disabled (dev mode), this check is skipped — `handleStartSession` sends an auth challenge directly without guarding against stale sessions.
 - **LED**: LEDC PWM on GPIO2 with configurable brightness (0-255). Patterns: BOOTING (1Hz blink), IDLE (double-blink), CONNECTED (solid), STREAMING (sine breathing), SHOT (3x rapid flash), LOW_BATTERY (slow pulse), ERROR (SOS).
 - **Haptic**: LEDC PWM on GPIO32 (150Hz), configurable intensity. Fires on shot detection.
 - **TX flow control**: XON (0x11) sent when TX queue drops below 16 items; XOFF (0x13) sent when TX queue exceeds 48 items. Sent as raw RFCOMM bytes, not framed protocol packets.
@@ -508,7 +507,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 3.9 | TX Flow Control | XON/XOFF when TX queue >48 items | DONE (main.cpp:bluetoothTask XON/XOFF as raw bytes) |
 | 3.10 | Stack Overflow Detection | Enable `configCHECK_FOR_STACK_OVERFLOW`, free stack in health | DONE (platformio.ini:configCHECK_FOR_STACK_OVERFLOW=2) |
 | 3.11 | Coredump on Fatal Errors | esp_core_dump partition, CMD_GET/ERASE_COREDUMP | DONE (src/coredump.cpp) |
-| 3.12 | Fix Stale Session State | `handleStartSession` stops stale session before starting fresh | DONE (src/bluetooth.cpp:handleStartSession) |
+| 3.12 | Fix Stale Session State | `handleStartSession` stops stale session before starting fresh (auth-enabled path only) | DONE (src/bluetooth.cpp:handleStartSession) |
 | 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format corrected to match firmware byte layout | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.14 | Parser Debug Logging | `PARSER_DEBUG` flag + `set_debug()` for per-packet trace | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.15 | Fix RX CRC Accumulation | protocol.cpp: feed TYPE+LEN as continuous bytes, not XOR of per-byte CRCs | DONE (src/protocol.cpp:READ_LEN_LO/HI) |
@@ -518,7 +517,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 |---|------|-------------|--------|
 | 4.1 | Factory Calibration | 500 samples at boot, compute accel/gyro bias, store in NVS | DONE (sensor.cpp:runFactoryCalibration, auto-run on first boot) |
 | 4.2 | User Calibration Routine | Guided calibration via app, quality score | DONE (sensor.cpp:runUserCalibration, CMD_CALIBRATE_START/STATUS) |
-| 4.3 | Adaptive Shot Thresholds | Statistical analysis of shots, self-tune thresholds | DONE (shot_detector.cpp:adaptive_threshold ring buffer, CMD_GET_SHOT_STATS) |
+| 4.3 | Adaptive Shot Thresholds | Statistical analysis of shots, self-tune thresholds | DONE (shot_detector.cpp:adaptive_threshold ring buffer, CMD_GET_SHOT_STATS). Live detection uses mean+2*stddev; printed suggestions on session stop use mean-0.5*stddev. |
 | 4.4 | Temperature Compensation | Temp coeff calibration, linear correction per sample | DONE (sensor.cpp:temperature compensation in readSensorBurst) |
 | 4.5 | Mount Position Calibration | Rotation matrix for rail orientation variants (Z yaw + X pitch + Y roll) | DONE (sensor.cpp:applyMountRotation 0-6, CMD_SET_MOUNT_MODE, companion_app GUI) |
 
