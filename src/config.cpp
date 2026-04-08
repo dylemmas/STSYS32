@@ -71,10 +71,10 @@ void initConfig() {
 
     g_config = loaded;
 
-    Serial.printf("[CONFIG] Loaded: SR=%d PZ=%d AX=%d DB=%d LED=%d DM=%d\n",
-                  g_config.sample_rate_hz, g_config.piezo_threshold,
-                  g_config.accel_threshold, g_config.debounce_ms,
-                  g_config.led_enabled, g_config.data_mode);
+    Serial.printf("[CONFIG] Loaded: SR=%d STRM=%d PZ=%d AX=%d DB=%d LED=%d DM=%d\n",
+                  g_config.sample_rate_hz, g_config.streaming_rate_hz,
+                  g_config.piezo_threshold, g_config.accel_threshold,
+                  g_config.debounce_ms, g_config.led_enabled, g_config.data_mode);
 }
 
 void loadConfig(FirmwareConfig* cfg) {
