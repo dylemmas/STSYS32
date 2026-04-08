@@ -99,6 +99,7 @@ void recoveryTask(void* param) {
                 Serial.println("[RECOVERY] I2C error detected, attempting recovery...");
                 // Run synchronous recovery (this blocks the recovery task, not sensor task)
                 recoverI2CBus();
+                Serial.printf("[RECOVERY] Done. success=%d, fail_count=%d\n", g_recoverySuccess, s_recoveryFailCount);
                 s_consecutiveErrors = 0;  // Reset from sensor.cpp's view
             }
         } else {

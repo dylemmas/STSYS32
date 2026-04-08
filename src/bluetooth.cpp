@@ -744,6 +744,9 @@ void sendSensorHealthPacket() {
     pkt.reserved[1] = 0;
     pkt.reserved[2] = 0;
 
+    Serial.printf("[BT] Sending health: degraded=%d, recovery=%d, i2c_err=%d, invalid=%d/%d\n",
+        isSensorDegraded(), isRecoveryInProgress(), health.i2c_error_count,
+        health.samples_invalid, health.samples_total);
     sendPacket(PKT_TYPE_EVT_SENSOR_HEALTH, &pkt, sizeof(pkt));
 }
 

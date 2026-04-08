@@ -64,6 +64,8 @@ extern QueueHandle_t recoveryQueue;   // Signal recovery task
 extern SemaphoreHandle_t recoveryDoneSem;  // Recovery completion signal to sensorTask
 extern volatile bool g_sensorDegraded; // True when MPU is not responding
 extern uint8_t s_consecutiveErrors;  // I2C error counter (declared static in sensor.cpp)
+extern bool g_recoverySuccess;       // Set by recoverI2CBus(), read by main.cpp RecoveryTask debug
+extern uint8_t s_recoveryFailCount;   // Recovery failure counter (declared static in sensor.cpp)
 
 // ================= FUNCTIONS =================
 void     scanI2CBus();  // Diagnostic: print all responding I2C addresses

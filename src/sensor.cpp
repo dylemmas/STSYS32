@@ -43,7 +43,7 @@ volatile bool g_sensorDegraded = false;
 // Recovery completion notification — RecoveryTask signals this after a
 // successful reinit so sensorTask can update g_sensorDegraded.
 SemaphoreHandle_t recoveryDoneSem = NULL;
-static bool g_recoverySuccess = false;
+bool g_recoverySuccess = false;
 
 // Health flags (bit 0 = degraded, bit 1 = recovery in progress)
 static volatile uint8_t s_sensorStatusFlags = 0;
@@ -63,7 +63,7 @@ static SensorHealth s_health = {
 
 // I2C error tracking
 uint8_t s_consecutiveErrors = 0;  // Non-static: accessed by recoveryTask in main.cpp
-static uint8_t s_recoveryFailCount = 0;
+uint8_t s_recoveryFailCount = 0;
 static uint8_t s_consecutiveInvalidReads = 0;
 static bool s_recoveryInProgress = false;
 
@@ -219,6 +219,8 @@ bool readSensorBurst(SensorSample* sample) {
 
         // Signal async recovery task (non-blocking) after 5 consecutive errors.
         // RecoveryTask clears s_consecutiveErrors and g_sensorDegraded on success.
+        Serial.printf("[SENSOR] I2C error #%d (endTransmission err=%d), consec_invalid=%d, recovery_in_progress=%d\n",
+            s_consecutiveErrors, err, s_consecutiveInvalidReads, s_recoveryInProgress);
         if (s_consecutiveErrors > 5 && recoveryQueue != NULL && !s_recoveryInProgress) {
             bool signal = true;
             xQueueSend(recoveryQueue, &signal, 0);
@@ -296,6 +298,8 @@ bool readSensorBurst(SensorSample* sample) {
     // Check for recovery completion signal from RecoveryTask
     if (xSemaphoreTake(recoveryDoneSem, 0) == pdTRUE) {
         // RecoveryTask completed — update degraded flag based on outcome
+        Serial.printf("[SENSOR] Recovery result: success=%d, g_sensorDegraded=%d, consecErrors=%d, consecInvalid=%d\n",
+            g_recoverySuccess, g_sensorDegraded, s_consecutiveErrors, s_consecutiveInvalidReads);
         g_sensorDegraded = !g_recoverySuccess;
         if (g_recoverySuccess) {
             g_sensorDegraded = false;
@@ -323,6 +327,8 @@ invalid_read:
     // Count consecutive invalid reads for degraded mode.
     // Only enter degraded mode if recovery is NOT in progress — let
     // RecoveryTask attempt recovery first before suppressing streaming.
+    Serial.printf("[SENSOR] invalid_read: consecInvalid=%d, consecErrors=%d, recovery_in_progress=%d\n",
+        s_consecutiveInvalidReads, s_consecutiveErrors, s_recoveryInProgress);
     if (!s_recoveryInProgress && ++s_consecutiveInvalidReads >= 5) {
         if (!g_sensorDegraded) {
             g_sensorDegraded = true;
