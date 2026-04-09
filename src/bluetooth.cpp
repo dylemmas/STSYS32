@@ -241,6 +241,27 @@ void sendPacket(uint8_t type, const void* payload, uint16_t len) {
     }
 }
 
+// Sends a packet immediately — bypasses the TX queue and writes directly to
+// SerialBT. Used for control/event packets (SESSION_STARTED, SENSOR_HEALTH,
+// ACK, ERROR, etc.) that must not be delayed by sample stream backpressure.
+// A static buffer is used since only one immediate packet is in flight at a time
+// (control packets are infrequent).
+void sendPacketImmediate(uint8_t type, const void* payload, uint16_t len) {
+    // TXItem.data is 256 bytes — max packet is well under that (max payload 64 + header)
+    TXItem item;
+    if (isLinkEncrypted() && type != PKT_TYPE_ENCRYPTED) {
+        item.length = encodePacketEncrypted(type, payload, len, item.data);
+    } else {
+        item.length = encodePacket(type, payload, len, item.data);
+    }
+    if (item.length > 0) {
+        Serial.printf("[BT] sendPacketImmediate: type=0x%02X len=%u\n", type, item.length);
+        SerialBT.write(item.data, item.length);  // Direct write — no queue
+    } else {
+        Serial.printf("[BT] sendPacketImmediate: type=0x%02X FAILED (encode error)\n", type);
+    }
+}
+
 void sendPacketBlocking(uint8_t type, const void* payload, uint16_t len) {
     TXItem item;
     item.length = encodePacket(type, payload, len, item.data);
@@ -254,7 +275,7 @@ void sendAck(uint8_t commandId, uint8_t status) {
     PktAck ack;
     ack.command_id = commandId;
     ack.status = status;
-    sendPacket(PKT_TYPE_RSP_ACK, &ack, sizeof(ack));
+    sendPacketImmediate(PKT_TYPE_RSP_ACK, &ack, sizeof(ack));
 }
 
 void sendError(uint8_t code, const char* msg) {
@@ -262,7 +283,7 @@ void sendError(uint8_t code, const char* msg) {
     err.error_code = code;
     strncpy(err.message, msg, sizeof(err.message) - 1);
     err.message[sizeof(err.message) - 1] = '\0';
-    sendPacket(PKT_TYPE_RSP_ERROR, &err, sizeof(err));
+    sendPacketImmediate(PKT_TYPE_RSP_ERROR, &err, sizeof(err));
 }
 
 // ================= COMMAND HANDLERS =================
@@ -281,7 +302,7 @@ static void handleStartSession(const uint8_t* payload, uint16_t len) {
     challengePkt.session_id = sessionId;
     generateChallenge(challengePkt.challenge);
     g_secState.session_id = sessionId;
-    sendPacket(PKT_TYPE_EVT_AUTH_CHALLENGE, &challengePkt, sizeof(challengePkt));
+    sendPacketImmediate(PKT_TYPE_EVT_AUTH_CHALLENGE, &challengePkt, sizeof(challengePkt));
     Serial.printf("[BT] Auth challenge sent for session %u\n", sessionId);
 #else
     // Development: start session directly without auth challenge.
@@ -500,7 +521,7 @@ static void handleOTAStatus(const uint8_t* payload, uint16_t len) {
     pkt.reserved = 0;
     pkt.bytes_received = s.bytes_received;
     pkt.total_expected = s.total_expected;
-    sendPacket(PKT_TYPE_RSP_OTA_STATUS, &pkt, sizeof(pkt));
+    sendPacketImmediate(PKT_TYPE_RSP_OTA_STATUS, &pkt, sizeof(pkt));
 }
 
 // ================= STORAGE HANDLERS =================
@@ -510,7 +531,7 @@ static void handleGetSessions(const uint8_t* payload, uint16_t len) {
     uint16_t count = enumerateSessions(ids, 32);
     // Send as series of EVT_SESSION_ENUM packets
     for (uint16_t i = 0; i < count; i++) {
-        sendPacket(0x21, &ids[i], sizeof(uint32_t));  // EVT_SESSION_ENUM = 0x21
+        sendPacketImmediate(0x21, &ids[i], sizeof(uint32_t));  // EVT_SESSION_ENUM = 0x21
         (void)i;
     }
     sendAck(PKT_TYPE_CMD_GET_SESSIONS, 0);
@@ -532,7 +553,7 @@ static void handleGetSessionData(const uint8_t* payload, uint16_t len) {
     }
 
     // Send header first
-    sendPacket(0x22, &hdr, sizeof(SessionHeader));  // EVT_SESSION_DATA = 0x22
+    sendPacketImmediate(0x22, &hdr, sizeof(SessionHeader));  // EVT_SESSION_DATA = 0x22
 
     // Send shots in chunks
     struct ShotEvent shots[32];
@@ -540,7 +561,7 @@ static void handleGetSessionData(const uint8_t* payload, uint16_t len) {
     while (true) {
         uint16_t n = loadSession(session_id, &hdr, shots, 32);
         if (n == 0) break;
-        sendPacket(0x22, shots, sizeof(struct ShotEvent) * n);
+        sendPacketImmediate(0x22, shots, sizeof(struct ShotEvent) * n);
         offset += n;
         if (n < 32) break;
     }
@@ -575,7 +596,7 @@ static void handleCalibrateStatus(const uint8_t* payload, uint16_t len) {
     CalibrationData cal;
     loadCalibrationData(&cal);
     uint8_t quality = cal.is_calibrated ? 90 : 0;  // Simplified quality score
-    sendPacket(0x24, &quality, 1);  // EVT_CALIBRATION_QUALITY
+    sendPacketImmediate(0x24, &quality, 1);  // EVT_CALIBRATION_QUALITY
 }
 
 static void handleSetMountMode(const uint8_t* payload, uint16_t len) {
@@ -595,7 +616,7 @@ static void handleGetCalibration(const uint8_t* payload, uint16_t len) {
     (void)payload; (void)len;
     CalibrationData cal;
     loadCalibrationData(&cal);
-    sendPacket(PKT_TYPE_RSP_ACK, &cal, sizeof(CalibrationData));
+    sendPacketImmediate(PKT_TYPE_RSP_ACK, &cal, sizeof(CalibrationData));
 }
 
 // ================= COREDUMP HANDLERS =================
@@ -620,7 +641,7 @@ static void handleGetCoredump(const uint8_t* payload, uint16_t len) {
             Serial.println("[BT] COREDUMP: read error, aborting");
             break;
         }
-        sendPacket(PKT_TYPE_RSP_ACK, chunk, bytesRead);  // Use RSP_ACK for raw binary payload
+        sendPacketImmediate(PKT_TYPE_RSP_ACK, chunk, bytesRead);  // Use RSP_ACK for raw binary payload
         offset += bytesRead;
     }
 
@@ -665,7 +686,7 @@ static void handleGetShotStats(const uint8_t* payload, uint16_t len) {
     }
     stats.adaptive_threshold = g_detectState.adaptive_threshold;
 
-    sendPacket(PKT_TYPE_RSP_ACK, &stats, sizeof(stats));
+    sendPacketImmediate(PKT_TYPE_RSP_ACK, &stats, sizeof(stats));
 }
 
 // ================= PACKET BUILDERS =================
@@ -686,7 +707,7 @@ static void sendInfoPacket() {
     info.mpu_whoami = health.mpu_whoami;
     info.reserved[0] = 0;
     info.reserved[1] = 0;
-    sendPacket(PKT_TYPE_RSP_INFO, &info, sizeof(info));
+    sendPacketImmediate(PKT_TYPE_RSP_INFO, &info, sizeof(info));
 }
 
 static void sendConfigPacket() {
@@ -704,7 +725,7 @@ static void sendConfigPacket() {
     pktCfg.streaming_rate_hz = cfg.streaming_rate_hz;
     strncpy(pktCfg.device_name, cfg.device_name, sizeof(pktCfg.device_name) - 1);
 
-    sendPacket(PKT_TYPE_RSP_CONFIG, &pktCfg, sizeof(pktCfg));
+    sendPacketImmediate(PKT_TYPE_RSP_CONFIG, &pktCfg, sizeof(pktCfg));
 }
 
 static void sendSessionStartedPacket() {
@@ -714,7 +735,7 @@ static void sendSessionStartedPacket() {
     pkt.battery_percent = g_lastSession.battery_start;
     pkt.sensor_health = getSensorHealthFlags();
     pkt.free_heap = esp_get_free_heap_size();
-    sendPacket(PKT_TYPE_EVT_SESSION_STARTED, &pkt, sizeof(pkt));
+    sendPacketImmediate(PKT_TYPE_EVT_SESSION_STARTED, &pkt, sizeof(pkt));
 }
 
 static void sendSessionStoppedPacket() {
@@ -724,7 +745,7 @@ static void sendSessionStoppedPacket() {
     pkt.shot_count = g_lastSession.shot_count;
     pkt.battery_end = getBatteryPercent();
     pkt.sensor_health = getSensorHealthFlags();
-    sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
+    sendPacketImmediate(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
 }
 
 void sendSensorHealthPacket() {
@@ -747,7 +768,7 @@ void sendSensorHealthPacket() {
     Serial.printf("[BT] Sending health: degraded=%d, recovery=%d, i2c_err=%d, invalid=%d/%d\n",
         isSensorDegraded(), isRecoveryInProgress(), health.i2c_error_count,
         health.samples_invalid, health.samples_total);
-    sendPacket(PKT_TYPE_EVT_SENSOR_HEALTH, &pkt, sizeof(pkt));
+    sendPacketImmediate(PKT_TYPE_EVT_SENSOR_HEALTH, &pkt, sizeof(pkt));
 }
 
 // ================= DISPATCH COMMAND =================

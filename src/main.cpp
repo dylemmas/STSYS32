@@ -184,8 +184,8 @@ void shotDetectorTask(void* param) {
                     s_shotsDetected++;
                     addShotToSession(&event);
 
-                    // Send shot event packet via TX queue (non-blocking)
-                    sendPacket(PKT_TYPE_EVT_SHOT_DETECTED, &event, sizeof(event));
+                    // Send shot event immediately — must not be queued behind samples
+                    sendPacketImmediate(PKT_TYPE_EVT_SHOT_DETECTED, &event, sizeof(event));
 
                     // LED + haptic feedback
                     triggerShotFeedback();
@@ -349,7 +349,7 @@ void bluetoothTask(void* param) {
                     pkt.shot_count = g_lastSession.shot_count;
                     pkt.battery_end = getBatteryPercent();
                     pkt.sensor_health = getSensorHealthFlags();
-                    sendPacket(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
+                    sendPacketImmediate(PKT_TYPE_EVT_SESSION_STOPPED, &pkt, sizeof(pkt));
                 }
                 wasConnected = true;
             } else {

@@ -56,12 +56,7 @@ extern FirmwareConfig g_config;
 #define DEFAULT_DEBOUNCE_MS       200
 #define DEFAULT_LED_ENABLED       true
 #define DEFAULT_DATA_MODE         0    // both
-// Reduced from 100 to 50 Hz — Windows BT SPP virtual COM port has limited
-// throughput (~2-3 KB/s effective) and the RFCOMM layer batches bytes.
-// At 100 Hz (32 bytes/packet = 3.2 KB/s), the TX queue backs up and
-// command-response packets (EVT_SESSION_STARTED, EVT_SENSOR_HEALTH) get
-// delayed or corrupted, causing the companion app to miss critical events.
-#define DEFAULT_STREAMING_RATE    50
+#define DEFAULT_STREAMING_RATE    100
 #define DEFAULT_DEVICE_NAME       "STASYS"
 
 // ================= FUNCTIONS =================
