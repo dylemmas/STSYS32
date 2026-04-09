@@ -54,7 +54,7 @@ def cmd_get_config() -> bytes:
 def cmd_set_config(config: RspConfig) -> bytes:
     """Encode CMD_SET_CONFIG with configuration payload.
 
-    Layout (46 bytes):
+    Layout (50 bytes, matches firmware PktConfig):
       0: sample_rate_hz (1)
       1-2: piezo_threshold (2, LE)
       3-4: accel_threshold (2, LE)
@@ -63,9 +63,9 @@ def cmd_set_config(config: RspConfig) -> bytes:
       8: data_mode (1)
       9-10: streaming_rate_hz (2, LE)
       11-30: device_name (20)
-      31-45: reserved (15)
+      31-49: reserved (19)
     """
-    payload = bytearray(46)
+    payload = bytearray(50)
     payload[0] = config.sample_rate_hz
     payload[1:3] = struct.pack("<H", config.piezo_threshold)
     payload[3:5] = struct.pack("<H", config.accel_threshold)

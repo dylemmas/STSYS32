@@ -117,10 +117,10 @@ I2C Error → recoveryQueue → RecoveryTask → recoverI2CBus() → reinit MPU6
 |------|------|---------|-------------|
 | 0x10 | EVT_SESSION_STARTED | 14 bytes | Session started, includes metadata |
 | 0x11 | EVT_SESSION_STOPPED | 12 bytes | Session ended, includes summary |
-| 0x12 | EVT_SHOT_DETECTED | 29 bytes | Shot detected event |
+| 0x12 | EVT_SHOT_DETECTED | 26 bytes | Shot detected event |
 | 0x13 | EVT_SENSOR_HEALTH | 11 bytes | Periodic health report |
 | 0x14 | EVT_AUTH_CHALLENGE | 20 bytes | Auth challenge from server |
-| 0x20 | DATA_RAW_SAMPLE | 26 bytes | Continuous IMU+piezo stream |
+| 0x20 | DATA_RAW_SAMPLE | 24 bytes | Continuous IMU+piezo stream |
 | 0x80 | RSP_ERROR | 33 bytes | Error response |
 | 0x81 | RSP_INFO | 14 bytes | Device/firmware info |
 | 0x82 | RSP_CONFIG | 50 bytes | Current configuration |
@@ -191,7 +191,7 @@ bytes_received: 4 bytes
 total_expected: 4 bytes
 ```
 
-**EVT_SHOT_DETECTED (29 bytes)**:
+**EVT_SHOT_DETECTED (26 bytes)**:
 ```
 session_id: 4 bytes
 timestamp_us: 4 bytes          (microseconds since session start)
@@ -207,7 +207,7 @@ recoil_axis: 1 byte           (0=X, 1=Y, 2=Z)
 recoil_sign: 1 byte           (+1 or -1)
 ```
 
-**DATA_RAW_SAMPLE (26 bytes)**:
+**DATA_RAW_SAMPLE (24 bytes)**:
 ```
 sample_counter: 4 bytes         (incrementing sample index)
 timestamp_us: 4 bytes          (microseconds since session start)
@@ -339,6 +339,12 @@ The Python app implements multi-layer error recovery:
    - If `_running=False` during disconnect, the reconnect loop exits cleanly without hanging
 
 4. **Degraded mode notification**: `EVT_SENSOR_HEALTH.reserved[0]` carries `degraded_flag`: 0=ok, 1=degraded (MPU failed), 2=recovery in progress. `main_window.py._on_packet()` logs a warning when degraded mode is active.
+
+5. **Protocol alignment fixes** (bugs fixed 2026-04-09):
+   - `EVT_SHOT_DETECTED`: Parser length check was 29 bytes; firmware sends 26. Every shot event was silently dropped. Fixed to 26 bytes. Also fixed `recoil_axis/sign` offsets from 26-27 to 24-25.
+   - `DATA_RAW_SAMPLE`: Parser had `temperature` and `piezo` swapped in struct layout and hardcoded `piezo=0`. Fixed to correctly read both fields from firmware payload.
+   - `CMD_SET_CONFIG`: Python sent 46 bytes; firmware expects 50. Config commands were always rejected. Fixed to 50 bytes with 19 reserved bytes.
+   - `FLOW_XON`: Was `0x14` (DC3); should be `0x11` (DC1). Fixed.
 
 ## Data Analysis
 
@@ -512,7 +518,7 @@ The firmware is a functional prototype. The following plan addresses all gaps fo
 | 3.10 | Stack Overflow Detection | Enable `configCHECK_FOR_STACK_OVERFLOW`, free stack in health | DONE (platformio.ini:configCHECK_FOR_STACK_OVERFLOW=2) |
 | 3.11 | Coredump on Fatal Errors | esp_core_dump partition, CMD_GET/ERASE_COREDUMP | DONE (src/coredump.cpp) |
 | 3.12 | Fix Stale Session State | `handleStartSession` stops stale session before starting fresh (auth-enabled path only) | DONE (src/bluetooth.cpp:handleStartSession) |
-| 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format corrected to match firmware byte layout | DONE (companion_app/stasys/protocol/parser.py) |
+| 3.13 | Fix DATA_RAW_SAMPLE Struct | Parser struct format `<IIhhhhhhHh` correctly reads temperature and piezo from firmware 24-byte PktRawSample (previously had temp/piezo swapped and hardcoded piezo=0) | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.14 | Parser Debug Logging | `PARSER_DEBUG` flag + `set_debug()` for per-packet trace | DONE (companion_app/stasys/protocol/parser.py) |
 | 3.15 | Fix RX CRC Accumulation | protocol.cpp: feed TYPE+LEN as continuous bytes, not XOR of per-byte CRCs | DONE (src/protocol.cpp:READ_LEN_LO/HI) |
 

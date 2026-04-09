@@ -138,15 +138,15 @@ def _make_frame(packet_type: int, payload: bytes) -> bytes:
 class TestParseDataRawSample:
     def test_parse_sample(self) -> None:
         parser = ProtocolParser()
-        # 24 bytes: counter(4)+ts(4)+accel_xyz(6)+gyro_xyz(6)+gyro_z(2)+temp(2)
-        # Format '<IIhhhhhhhh': 2xI(8) + 8xh(16) = 24 bytes, 10 values
-        # vals[7]=gyro_z, vals[9]=temperature (piezo not in DATA_RAW_SAMPLE)
-        payload = struct.pack("<IIhhhhhhhh",
+        # 24 bytes: counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+temp(2)+piezo(2)
+        # Format '<IIhhhhhhHh': 2xI(8) + 6xh(12) + 1xH(2) + 1xh(2) = 24 bytes, 10 values
+        # vals: counter, ts, ax, ay, az, gx, gy, gz, temperature, piezo
+        payload = struct.pack("<IIhhhhhhHh",
                               42, 1_000_000,  # counter, timestamp
                               8192, 0, 0,     # accel_x/y/z
-                              0, 0, -655,      # gyro_x/y/z
-                              567,             # vals[8]: gyro_z reads vals[7]=-655 (correct)
-                              1234)            # vals[9]: temperature
+                              0, 0, -655,     # gyro_x/y/z
+                              567,             # temperature (int16)
+                              2048)            # piezo (uint16)
         frame = _make_frame(PacketType.DATA_RAW_SAMPLE, payload)
 
         parser.feed(frame)
@@ -158,10 +158,9 @@ class TestParseDataRawSample:
         assert pkt.accel_x == 8192
         assert pkt.accel_x_ms2 == pytest.approx(9.81, rel=1e-3)
         assert pkt.gyro_z == -655
-        assert pkt.temperature == 1234
-        assert pkt.temperature_c == pytest.approx(1234 / 340.0 + 36.53, rel=1e-2)
-        # piezo is hardcoded to 0 in DATA_RAW_SAMPLE (not in firmware payload)
-        assert pkt.piezo == 0
+        assert pkt.temperature == 567
+        assert pkt.piezo == 2048
+        assert pkt.temperature_c == pytest.approx(567 / 340.0 + 36.53, rel=1e-2)
 
 
 # =============================================================================
@@ -219,10 +218,10 @@ class TestParseEvtSessionStopped:
 class TestParseEvtShotDetected:
     def test_parse_shot_detected(self) -> None:
         parser = ProtocolParser()
-        # 29 bytes: session_id(4) + timestamp_us(4) + shot_number(2) + piezo_peak(2)
+        # 26 bytes: session_id(4) + timestamp_us(4) + shot_number(2) + piezo_peak(2)
         #           + accel_peak_xyz(6) + gyro_peak_xyz(6) + recoil_axis(1) + recoil_sign(1)
-        #           + [reserved 5]
-        d = bytearray(29)
+        # Matches firmware ShotEvent sizeof=26 (no padding with __attribute__((packed)))
+        d = bytearray(26)
         struct.pack_into("<I", d, 0, 1)          # session_id
         struct.pack_into("<I", d, 4, 2_000_000)   # timestamp_us
         struct.pack_into("<H", d, 8, 3)           # shot_number
@@ -232,9 +231,9 @@ class TestParseEvtShotDetected:
         struct.pack_into("<h", d, 16, 1000)       # accel_z_peak
         struct.pack_into("<h", d, 18, 200)        # gyro_x_peak
         struct.pack_into("<h", d, 20, -100)       # gyro_y_peak
-        struct.pack_into("<h", d, 22, 50)         # gyro_z_peak
-        d[26] = 0                                  # recoil_axis (X)
-        d[27] = 1                                  # recoil_sign (+1)
+        struct.pack_into("<h", d, 22, 50)          # gyro_z_peak
+        d[24] = 0                                  # recoil_axis (X)
+        d[25] = 1                                  # recoil_sign (+1)
 
         frame = _make_frame(PacketType.EVT_SHOT_DETECTED, bytes(d))
         parser.feed(frame)
@@ -414,9 +413,9 @@ class TestParserResync:
 
     def test_discard_leading_garbage(self) -> None:
         parser = ProtocolParser()
-        # 26-byte payload: counter(4)+ts(4)+accel_xyz(6)+gyro_xyz(6)+temp(2)+piezo(2)
-        # Format '<IIhhhhhhhHh': 11 values
-        payload = struct.pack("<IIhhhhhhhHh", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # 11 values: 2I+7h+H+h
+        # 24-byte payload: counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+temp(2)+piezo(2)
+        # Format '<IIhhhhhhHh': 10 values
+        payload = struct.pack("<IIhhhhhhHh", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         frame = _make_frame(PacketType.DATA_RAW_SAMPLE, payload)
         garbage = b"\x00\x01\x02\xFF\xEE"
         combined = garbage + frame
@@ -428,7 +427,7 @@ class TestParserResync:
 
     def test_split_packet(self) -> None:
         parser = ProtocolParser()
-        payload = struct.pack("<IIhhhhhhhHh", 7, 0, 0, 0, 0, 0, 0, 0, 100, 0, 500)  # ax=0,ay=0,az=0,gx=0,gy=0,gz=0,temp=100,piezo=500
+        payload = struct.pack("<IIhhhhhhHh", 7, 0, 0, 0, 0, 0, 0, 0, 100, 500)  # counter=7, temp=100, piezo=500
         frame = _make_frame(PacketType.DATA_RAW_SAMPLE, payload)
         split = len(frame) // 2
 
@@ -439,11 +438,12 @@ class TestParserResync:
         pkt = parser.packet_queue.get_nowait()
         assert isinstance(pkt, DataRawSample)
         assert pkt.sample_counter == 7
+        assert pkt.piezo == 500
 
     def test_callback_mode(self) -> None:
         received = []
         parser = ProtocolParser(packet_callback=received.append)
-        payload = struct.pack("<IIhhhhhhhHh", 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # 11 values: 2I+7h+H+h
+        payload = struct.pack("<IIhhhhhhHh", 99, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # counter=99
         frame = _make_frame(PacketType.DATA_RAW_SAMPLE, payload)
 
         parser.feed(frame)
@@ -492,7 +492,7 @@ class TestCommands:
         data = cmd_set_config(cfg)
         assert data[2] == 0x05
         length = struct.unpack_from("<H", data, 3)[0]
-        assert length == 46
+        assert length == 50
 
     def test_command_crc_validates(self) -> None:
         # Verify the encoded frame can be re-parsed

@@ -130,7 +130,7 @@ struct PktSessionStopped {
     uint8_t  sensor_health;
 } __attribute__((packed));
 
-// EVT_SHOT_DETECTED
+// EVT_SHOT_DETECTED (26 bytes total, no padding with __attribute__((packed)))
 struct PktShotDetected {
     uint32_t session_id;
     uint32_t timestamp_us;

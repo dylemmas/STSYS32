@@ -60,16 +60,14 @@ def make_data_raw_sample(
 
     Firmware struct (24 bytes):
         counter(4) + ts(4) + ax(2) + ay(2) + az(2) + gx(2) + gy(2) + gz(2)
-        + temperature(2) + gyro_z(2)
+        + temperature(2) + piezo(2)
 
-    Layout: counter, timestamp, ax, ay, az, gx, gy, gz, temperature, gyro_z
-    Format: '<IIhhhhhhhHh' (10 values, 24 bytes)
-    Note: temperature is unsigned (uint16_t), gyro_z is signed (int16_t).
-    The Python struct matches: 9 signed shorts (h) + 1 signed short (h) for gyro_z.
-    Piezo is NOT in the DATA_RAW_SAMPLE struct — it's in EVT_SHOT_DETECTED only.
+    Layout: counter, timestamp, ax, ay, az, gx, gy, gz, temperature, piezo
+    Format: '<IIhhhhhhHh' (10 values, 24 bytes)
+    Matches the Python parser struct layout exactly.
     """
     payload = struct.pack(
-        "<IIhhhhhhhh",
+        "<IIhhhhhhHh",
         sample_counter,
         timestamp_us,
         accel_x,
@@ -77,9 +75,9 @@ def make_data_raw_sample(
         accel_z,
         gyro_x,
         gyro_y,
-        gyro_z,        # 8th field: gyro_z (offset 14)
-        gyro_z,        # 9th field: piezo (offset 20) — hardcoded to 0 in dataclass
-        temperature,   # 10th field: temperature (offset 22)
+        gyro_z,
+        temperature,
+        piezo,
     )
     return make_frame(int(PacketType.DATA_RAW_SAMPLE), payload)
 
@@ -100,11 +98,12 @@ def make_evt_shot_detected(
 ) -> bytes:
     """Build an EVT_SHOT_DETECTED packet matching the firmware PktShotDetected struct.
 
-    29 bytes: session_id(4) + ts(4) + shot_number(2) + piezo_peak(2)
+    26 bytes: session_id(4) + ts(4) + shot_number(2) + piezo_peak(2)
               + accel_peak_xyz(6) + gyro_peak_xyz(6) + recoil_axis(1)
-              + recoil_sign(1) + reserved(3)
+              + recoil_sign(1)
+    Matches firmware ShotEvent sizeof=26 (no padding with __attribute__((packed))).
     """
-    payload = bytearray(29)
+    payload = bytearray(26)
     struct.pack_into("<I", payload, 0, session_id)
     struct.pack_into("<I", payload, 4, timestamp_us)
     struct.pack_into("<H", payload, 8, shot_number)
@@ -115,8 +114,8 @@ def make_evt_shot_detected(
     struct.pack_into("<h", payload, 18, gyro_x_peak)
     struct.pack_into("<h", payload, 20, gyro_y_peak)
     struct.pack_into("<h", payload, 22, gyro_z_peak)
-    payload[26] = recoil_axis
-    payload[27] = recoil_sign & 0xFF  # int8 → byte
+    payload[24] = recoil_axis & 0xFF  # int8 → byte
+    payload[25] = recoil_sign & 0xFF  # int8 → byte
     return make_frame(int(PacketType.EVT_SHOT_DETECTED), bytes(payload))
 
 
@@ -198,9 +197,9 @@ def test_data_raw_sample_loopback() -> bool:
         ("accel_z", pkt.accel_z, 0),
         ("gyro_x", pkt.gyro_x, 655),
         ("gyro_y", pkt.gyro_y, 0),
-        ("gyro_z", pkt.gyro_z, -655),      # vals[8]
-        ("temperature", pkt.temperature, 340),  # vals[9]
-        ("piezo", pkt.piezo, 0),              # not in DATA_RAW_SAMPLE
+        ("gyro_z", pkt.gyro_z, -655),
+        ("temperature", pkt.temperature, 340),
+        ("piezo", pkt.piezo, 2048),
     ]
     for name, actual, expected in checks:
         if actual != expected:

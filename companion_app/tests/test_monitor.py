@@ -156,7 +156,7 @@ class TestParserIntegration:
         from stasys.protocol.crc import crc16
 
         parser = ProtocolParser()
-        d = bytearray(29)
+        d = bytearray(26)  # 26 bytes: matches firmware ShotEvent sizeof
         struct.pack_into("<I", d, 0, 1)
         struct.pack_into("<I", d, 4, 1_000_000)
         struct.pack_into("<H", d, 8, 1)
@@ -167,8 +167,8 @@ class TestParserIntegration:
         struct.pack_into("<h", d, 18, 200)
         struct.pack_into("<h", d, 20, -100)
         struct.pack_into("<h", d, 22, 50)
-        d[26] = 0  # recoil_axis = X
-        d[27] = 1  # recoil_sign = +1
+        d[24] = 0  # recoil_axis = X
+        d[25] = 1  # recoil_sign = +1
 
         header = bytes([PacketType.EVT_SHOT_DETECTED]) + struct.pack("<H", len(d))
         crc = crc16(header + bytes(d))

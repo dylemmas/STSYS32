@@ -43,8 +43,8 @@ class PacketType(IntEnum):
     PKT_TYPE_ENCRYPTED = 0xF0
 
     # Flow control (not real protocol packets, handled separately)
-    FLOW_XON = 0x14
-    FLOW_XOFF = 0x14
+    FLOW_XON = 0x11   # DC1 — resume transmission
+    FLOW_XOFF = 0x13  # DC3 — pause transmission
 
 
 # =============================================================================
@@ -277,9 +277,9 @@ class RspInfo:
 
 @dataclass
 class RspConfig:
-    """Configuration response/set command (46 bytes).
+    """Configuration response/set command (50 bytes).
 
-    Mirrors CMD_SET_CONFIG layout.
+    Mirrors CMD_SET_CONFIG layout (firmware PktConfig = 50 bytes).
 
     Attributes:
         sample_rate_hz: IMU sample rate (50, 100, or 200).

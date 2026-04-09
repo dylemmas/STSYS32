@@ -62,21 +62,21 @@ _MAX_PAYLOAD = 256  # sanity cap
 
 
 # Pre-compiled struct for DATA_RAW_SAMPLE (24 bytes, matches firmware PktRawSample):
-#   counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+temp(2)
-#   Struct '<IIhhhhhhhH': 2xI(8) + 8xh(16) + 1xH(2) = 24 bytes, 10 values
-#   Firmware field order: counter, ts, accel_x/y/z, gyro_x/y/z, gyro_z, temperature
-#   vals[7]=gyro_z, vals[9]=temperature (vals[8]=gz padding in this layout)
-_STRUCT_RAW_SAMPLE = struct.Struct("<IIhhhhhhhH")
+#   counter(4)+ts(4)+accel_x(2)+accel_y(2)+accel_z(2)+gyro_x(2)+gyro_y(2)+gyro_z(2)+temp(2)+piezo(2)
+#   Struct '<IIhhhhhhHh': 2xI(8) + 6xh(12) + 1xH(2) + 1xh(2) = 24 bytes, 10 values
+#   vals: [0]=counter, [1]=ts, [2]=accel_x, [3]=accel_y, [4]=accel_z, [5]=gyro_x,
+#         [6]=gyro_y, [7]=gyro_z, [8]=temperature, [9]=piezo
+_STRUCT_RAW_SAMPLE = struct.Struct("<IIhhhhhhHh")
 
 # Pre-compiled struct for RSP_ACK (2 bytes)
 _STRUCT_ACK = struct.Struct("<BB")
 
 
 def _unpack_config(data: bytes) -> RspConfig:
-    """Unpack 46-byte configuration payload."""
+    """Unpack 50-byte configuration payload (firmware PktConfig)."""
     if len(data) < 11:
         raise ValueError(f"Config payload too short: {len(data)} bytes")
-    d = data[:46]
+    d = data[:50]
     return RspConfig(
         sample_rate_hz=d[0],
         piezo_threshold=int.from_bytes(d[1:3], "little"),
@@ -278,12 +278,12 @@ class ProtocolParser:
                 )
 
             elif packet_type == PacketType.EVT_SHOT_DETECTED:
-                # 29 bytes: session_id(4) + timestamp_us(4) + shot_number(2) + piezo_peak(2)
+                # 26 bytes: session_id(4) + timestamp_us(4) + shot_number(2) + piezo_peak(2)
                 #           + accel_peak_xyz(2*3) + gyro_peak_xyz(2*3) + recoil_axis(1) + recoil_sign(1)
-                #           + [reserved 5 bytes]
-                if len(payload) < 29:
-                    raise ValueError(f"EVT_SHOT_DETECTED: expected 29 bytes, got {len(payload)}")
-                d = payload[:29]
+                # Matches firmware ShotEvent sizeof=26 (no padding with __attribute__((packed)))
+                if len(payload) < 26:
+                    raise ValueError(f"EVT_SHOT_DETECTED: expected 26 bytes, got {len(payload)}")
+                d = payload[:26]
                 return EvtShotDetected(
                     session_id=int.from_bytes(d[0:4], "little"),
                     timestamp_us=int.from_bytes(d[4:8], "little"),
@@ -295,8 +295,8 @@ class ProtocolParser:
                     gyro_x_peak=int.from_bytes(d[18:20], "little", signed=True),
                     gyro_y_peak=int.from_bytes(d[20:22], "little", signed=True),
                     gyro_z_peak=int.from_bytes(d[22:24], "little", signed=True),
-                    recoil_axis=d[26] if d[26] < 128 else d[26] - 256,
-                    recoil_sign=d[27] if d[27] < 128 else d[27] - 256,
+                    recoil_axis=d[24] if d[24] < 128 else d[24] - 256,
+                    recoil_sign=d[25] if d[25] < 128 else d[25] - 256,
                 )
 
             elif packet_type == PacketType.EVT_SENSOR_HEALTH:
@@ -304,7 +304,7 @@ class ProtocolParser:
                 #           + i2c_recovery_count(1) + reserved(4)
                 # reserved[0] is used as degraded-mode signal (1=degraded, 2=recovery in progress)
                 if len(payload) < 11:
-                    raise ValueError(f"EVT_SENSOR_HEALTH: expected 8+ bytes, got {len(payload)}")
+                    raise ValueError(f"EVT_SENSOR_HEALTH: expected 11 bytes, got {len(payload)}")
                 d = payload[:11]
                 return EvtSensorHealth(
                     mpu_present=d[0],
@@ -332,8 +332,8 @@ class ProtocolParser:
                     gyro_x=vals[5],
                     gyro_y=vals[6],
                     gyro_z=vals[7],
-                    temperature=vals[9],
-                    piezo=0,
+                    temperature=vals[8],
+                    piezo=vals[9],
                 )
 
             elif packet_type == PacketType.RSP_INFO:
