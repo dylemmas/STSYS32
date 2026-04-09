@@ -275,7 +275,7 @@ CRC computed over (IV + CIPHERTEXT + TAG)
 ## Typical Workflow
 
 1. **Pair & Connect** — Pair ESP32 via Windows Bluetooth Settings (Just Works, no PIN needed)
-2. **Note COM Port** — Find "Standard Serial over Bluetooth link (COMx)" in Device Manager
+2. **Note COM Port** — Use the **Scan** button in the GUI (or `--scan` CLI flag) to auto-detect STASYS ports. Windows creates an Outgoing (`ESP32SPP`) and Incoming port pair — the app uses the Outgoing port by default.
 3. **Get Info** — Send `CMD_GET_INFO` to verify firmware version
 4. **Configure** — Optionally send `CMD_SET_CONFIG` to adjust thresholds/rates
 5. **Start Session** — Send `CMD_START_SESSION`, receive `EVT_SESSION_STARTED`
@@ -303,9 +303,9 @@ The Python companion app performs automatic IMU calibration on every "New Sessio
 
 1. **Trigger**: User clicks "New Session" → `CMD_START_SESSION` sent → `EVT_SESSION_STARTED` received
 2. **Collection**: 500 raw samples fed to `IMUCalibrator` (`stasys/core/imu_calibrator.py`) from the `DATA_RAW_SAMPLE` stream
-3. **Static detection**: Rolling 50-sample window of accelerometer magnitude; std dev < 0.1 m/s² = static. Motion resets accumulation.
+3. **Motion tolerance**: Samples are accumulated regardless of motion state — the running mean naturally filters out brief motion noise over 500 samples. The static indicator is informational only (rolling 50-sample std dev < 0.1 m/s²). This avoids the prior bug where accelerometer quantization noise between samples caused the static flag to flicker, resetting the counter and preventing calibration from completing.
 4. **Bias computation**: Mean of collected samples → gyro bias (deg/s) and accel bias (raw counts). Ported from C++ ROS reference logic (`detectStaticState` + `performCalibration`).
-5. **Application**: `calibrator.apply_bias()` called in `tab_live.py._on_sample()` for every sample after calibration completes
+5. **Application**: `calibrator.apply_bias()` called in `tab_live.py._on_sample()` for every sample after calibration completes. Gyro bias is captured at calibration completion so integration is bias-free from the first post-calibration sample.
 6. **UI overlay**: `_CalibrationOverlay` widget on the Live tab shows progress bar, sample count, and static status indicator
 7. **Skip option**: "Skip Calibration" button commits partial bias if ≥1 sample collected
 
@@ -319,9 +319,11 @@ The Python app implements multi-layer error recovery:
    - Read loop catches `SerialException`, `OSError`, and all unexpected exceptions — thread never silently dies
    - After 5 consecutive errors, forces reconnection attempt (clears port, reopens, drains stale queue)
    - Empty reads (timeout) are not treated as errors — only actual exceptions increment the counter
-   - `_drain_queue()` called on every disconnect/reconnect to prevent stale bytes from corrupting the parser
    - Exponential back-off on reconnect (3s → 30s max) prevents tight retry loops
    - Permission denied on first open attempt: sleeps 1s and retries once
+   - **Bluetooth handshake retries**: winerror 121 (RFCOMM handshake timeout) and winerror 31 (BT radio glitch) retry up to 3 times with 2s delay each. A 500ms settling delay after port open allows the ESP32 BluetoothTask to finish RFCOMM setup before commands are sent.
+   - **Port auto-discovery**: `connect()` with no port argument scans for STASYS ports (`ESP32SPP`/`OUTGOING`/`INCOMING` keywords in port description) and tries them in order. Port existence is validated before opening to catch stale saved-port values.
+   - **Parser initialization**: `_parser` is set by the GUI **after** `connect()` returns. `_packet_reader` buffers incoming data in a `pending` list until `_parser` is ready, preventing the race where packets arrive before the parser exists.
 
 2. **Parser crash protection** (`parser.py`):
    - `MAX_CONSECUTIVE_DISCARDS = 1024`: if 1024 bytes are consumed without advancing parser state (no sync found, no valid frame), forces a full state reset and clears the buffer
@@ -329,6 +331,7 @@ The Python app implements multi-layer error recovery:
    - Increments counter on each garbage byte (no sync found, CRC mismatch, length overflow)
    - `reset()` method allows application to manually reset parser state (used after ESP32 restart)
    - `_force_reset()` logs the reason for diagnostics
+   - On full reset, preserves the last `0xAA` byte in the buffer — if the next incoming chunk contains `0x55`, the frame starts there and avoids a one-byte parse delay
 
 3. **Flow control** (`flow_control.py`):
    - `FlowControl.handle_xon()` / `handle_xoff()` are wrapped in try/except — any error is logged but doesn't propagate
@@ -344,7 +347,7 @@ The Python app implements multi-layer error recovery:
 - **Gyroscope**: 500 dps range → raw / 65.5 = deg/s
 - **Sample rate**: Configurable (default 100 Hz)
 - **Plot**: accel_x/y over time → trace movement in 2D
-- **Dot movement**: Accelerometer-based tilt angle (atan2 of calibrated accel_x/y/z → roll/pitch in degrees). After calibration bias subtraction, gravity is the dominant signal. Using atan2 gives stable angles bounded by ±90° — cannot drift unlike double-integration. Scale factor 1.0:1 (degrees → plot units).
+- **Dot movement**: Complementary filter combining gyro integration with accelerometer-based tilt correction. Gyro rate (deg/s) is integrated to predict angle, then corrected toward EMA-smoothed accelerometer angles (CF_ALPHA=0.96, ACCEL_SMOOTH_FACTOR=0.7). Gyro dominates short-term response; accelerometer prevents long-term drift. On calibration completion, filter angles are initialized from the current smoothed accel angle to avoid discontinuity. On re-zero, gyro bias is recaptured at the new position and filter angles reset to 0.
 - **Recoil analysis**: Peak accel magnitude and direction during shot window
 
 ### Shot Detection (from EVT_SHOT_DETECTED)
@@ -359,7 +362,7 @@ The Python app implements multi-layer error recovery:
 - **Baud rate**: N/A (SPP is stream-oriented)
 - **Pairing**: Just Works SSP (no PIN required)
 - **Default device name**: "STASYS" (stored in NVS)
-- **Windows COM port**: "Standard Serial over Bluetooth link (COMx)"
+- **Windows COM port**: Windows creates a pair of virtual SPP ports when pairing: an **Outgoing** port (description contains `ESP32SPP` or `OUTGOING`) and an **Incoming** port (`INCOMING`). The app's `find_stasys_ports()` returns both; `connect()` prefers Outgoing and falls back to Incoming. Auto-discovery works with either. The GUI also has a **Scan** button to find and auto-fill the port field.
 - **BT TX Power**: ESP_PWR_LVL_P9 (+9dBm, maximum) — improves range on battery
 
 ## Python Companion App

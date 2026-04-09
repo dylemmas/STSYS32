@@ -150,6 +150,12 @@ class LiveTab(QWidget):
     TRAIL_SEGMENTS = 10           # number of fading segments
     WOBBLE_WINDOW = 20            # samples for RMS calculation
 
+    # Complementary filter: gyro weight (higher = smoother, less drift correction)
+    # 0.96 means gyro contributes 96%, accelerometer contributes 4%
+    CF_ALPHA: float = 0.96
+    # EMA smoothing factor for accelerometer angles (0.7 = 70% prev, 30% new)
+    ACCEL_SMOOTH_FACTOR: float = 0.7
+
     def __init__(self, router: DataRouter, main_window: MainWindow) -> None:
         super().__init__()
         self._router = router
@@ -171,6 +177,12 @@ class LiveTab(QWidget):
 
         # Previous timestamp for dt calculation
         self._prev_timestamp_us: int | None = None
+
+        # Complementary filter state
+        self._cf_angle_x: float = 0.0
+        self._cf_angle_y: float = 0.0
+        self._cf_accel_smooth_x: float = 0.0
+        self._cf_accel_smooth_y: float = 0.0
 
         # Steadiness state
         self._hold_time = 0.0
@@ -470,9 +482,13 @@ class LiveTab(QWidget):
     def _on_calibrating(self, calibrating: bool) -> None:
         """Show/hide calibration overlay and reset plot on calibration state change."""
         if calibrating:
-            # Reset angle integration for fresh calibration
+            # Reset complementary filter for fresh calibration
             self._prev_timestamp_us = None
             self._bias_captured = False
+            self._cf_angle_x = 0.0
+            self._cf_angle_y = 0.0
+            self._cf_accel_smooth_x = 0.0
+            self._cf_accel_smooth_y = 0.0
             self._trace_x.clear()
             self._trace_y.clear()
             self._timestamps.clear()
@@ -481,13 +497,23 @@ class LiveTab(QWidget):
             self._angle_y = 0.0
             self._hold_start_time = 0.0
             self._stable_since = 0.0
-            # Reset auto-scroll tracking
             # Reset plot view to center (0,0) with ±4 deg range
             self._pw.setXRange(-4, 4, padding=0)
             self._pw.setYRange(-4, 4, padding=0)
             self._calibration_overlay.show_calibrating(True)
         else:
             self._calibration_overlay.show_calibrating(False)
+            # Calibration just finished — capture gyro bias now so the filter
+            # uses it from the NEXT sample onward (no drift buildup before capture).
+            calibrator = self._mw.get_calibrator()
+            if calibrator.is_calibrated:
+                self._gyro_bias_x = calibrator.bias.gyro_x
+                self._gyro_bias_y = calibrator.bias.gyro_y
+                self._bias_captured = True
+                # Initialize filter angles from current smoothed accel so there's no
+                # discontinuity when accel correction turns on.
+                self._cf_angle_x = self._cf_accel_smooth_x
+                self._cf_angle_y = self._cf_accel_smooth_y
 
     def _on_calibration_progress(self, progress: float) -> None:
         """Update calibration overlay with current progress and static status."""
@@ -513,6 +539,8 @@ class LiveTab(QWidget):
                 accel_z=calibrator._accel_z_sum / n,
             )
             calibrator._is_calibrated = True
+        # Emit calibrating(False) → _on_calibrating(False) captures bias and
+        # initializes filter angles. Do this BEFORE hiding the overlay.
         self._router.calibrating.emit(False)
 
     # ── Packet handlers ───────────────────────────────────────────────────────
@@ -531,6 +559,11 @@ class LiveTab(QWidget):
             self._angle_y = 0.0
             self._hold_start_time = 0.0
             self._stable_since = 0.0
+            # Reset complementary filter state
+            self._cf_angle_x = 0.0
+            self._cf_angle_y = 0.0
+            self._cf_accel_smooth_x = 0.0
+            self._cf_accel_smooth_y = 0.0
 
         # Compute dt from actual firmware timestamp (must be in SECONDS)
         if self._prev_timestamp_us is not None:
@@ -543,12 +576,10 @@ class LiveTab(QWidget):
 
         calibrator = self._mw.get_calibrator()
 
-        # ── Tilt angle from accelerometer (no drift, bounded by ±90°) ─────────
-        # After bias subtraction, accel represents gravity projected onto each axis.
-        # atan2 gives a stable angle that naturally returns to 0 when level —
-        # double-integration of raw accel would drift even with perfect bias.
+        # ── Accelerometer values (m/s²) ────────────────────────────────────────
+        # After calibration, subtract accel bias for cleaner angle estimation.
+        # During calibration (before is_calibrated), use raw values — no bias yet.
         if calibrator.is_calibrated:
-            # Use calibrator for correct raw-bias subtraction before unit conversion
             _, _, _, ax_ms2, ay_ms2, az_ms2 = calibrator.apply_bias(
                 sample.gyro_x, sample.gyro_y, sample.gyro_z,
                 sample.accel_x, sample.accel_y, sample.accel_z,
@@ -558,14 +589,48 @@ class LiveTab(QWidget):
             ay_ms2 = sample.accel_y / 8192.0 * 9.81
             az_ms2 = sample.accel_z / 8192.0 * 9.81
 
-        # Tilt angles in degrees — naturally bounded, cannot drift.
-        # roll: left/right tilt (device y-axis rotation), pitch: forward/back tilt.
-        SCALE_X = 1.0  # degrees → plot units
-        SCALE_Y = 1.0  # degrees → plot units
-        roll  = math.degrees(math.atan2(-ax_ms2, math.sqrt(ay_ms2**2 + az_ms2**2)))
-        pitch = math.degrees(math.atan2(ay_ms2, math.sqrt(ax_ms2**2 + az_ms2**2)))
-        disp_x = roll  * SCALE_X
-        disp_y = pitch * SCALE_Y
+        # ── Complementary filter ──────────────────────────────────────────────
+        # Phase 1: EMA smoothing on accel angles (reduces per-sample noise).
+        accel_roll  = math.degrees(math.atan2(-ax_ms2, math.sqrt(ay_ms2**2 + az_ms2**2)))
+        accel_pitch = math.degrees(math.atan2(ay_ms2, math.sqrt(ax_ms2**2 + az_ms2**2)))
+
+        if self._cf_accel_smooth_x == 0.0:
+            self._cf_accel_smooth_x = accel_roll
+        if self._cf_accel_smooth_y == 0.0:
+            self._cf_accel_smooth_y = accel_pitch
+
+        self._cf_accel_smooth_x = (
+            self.ACCEL_SMOOTH_FACTOR * self._cf_accel_smooth_x +
+            (1.0 - self.ACCEL_SMOOTH_FACTOR) * accel_roll
+        )
+        self._cf_accel_smooth_y = (
+            self.ACCEL_SMOOTH_FACTOR * self._cf_accel_smooth_y +
+            (1.0 - self.ACCEL_SMOOTH_FACTOR) * accel_pitch
+        )
+
+        # Phase 2: Compute gyro rate (deg/s) and integrate.
+        # Gyro bias is captured in _on_calibrating(False) when calibration completes,
+        # so from the first post-calibration sample onward, integration is bias-free.
+        gyro_rate_x = (sample.gyro_x - self._gyro_bias_x) / 65.5
+        gyro_rate_y = (sample.gyro_y - self._gyro_bias_y) / 65.5
+
+        # Predict: integrate gyro rate → gyro-predicted angle.
+        self._cf_angle_x += gyro_rate_x * dt
+        self._cf_angle_y += gyro_rate_y * dt
+
+        # Phase 3: Correct — pull gyro prediction toward smoothed accel angle.
+        # High alpha (0.96) = gyro dominates (smooth), accel prevents long-term drift.
+        self._cf_angle_x = (
+            self.CF_ALPHA * self._cf_angle_x +
+            (1.0 - self.CF_ALPHA) * self._cf_accel_smooth_x
+        )
+        self._cf_angle_y = (
+            self.CF_ALPHA * self._cf_angle_y +
+            (1.0 - self.CF_ALPHA) * self._cf_accel_smooth_y
+        )
+
+        disp_x = self._cf_angle_x
+        disp_y = self._cf_angle_y
 
         # Apply zero offset (RE-ZERO baseline)
         offset_x, offset_y = self._mw.get_zero_offset()
@@ -770,6 +835,11 @@ class LiveTab(QWidget):
         self._wobble_window.clear()
         self._jerk_mag = 0.0
         self._phase = "—"
+        # Reset complementary filter
+        self._cf_angle_x = 0.0
+        self._cf_angle_y = 0.0
+        self._cf_accel_smooth_x = 0.0
+        self._cf_accel_smooth_y = 0.0
 
     def on_rezero(self) -> None:
         """Reset zero baseline and clear trail."""
@@ -783,6 +853,13 @@ class LiveTab(QWidget):
         self._dot.setData([0.0], [0.0])
         self._hold_time = 0.0
         self._stable_since = 0.0
-        # Re-capture gyro bias so integration resets cleanly
-        self._bias_captured = False
+        # Re-capture gyro bias at current position for complementary filter
+        calibrator = self._mw.get_calibrator()
+        if calibrator.is_calibrated:
+            self._gyro_bias_x = calibrator.bias.gyro_x
+            self._gyro_bias_y = calibrator.bias.gyro_y
+        self._bias_captured = True
+        # Reset complementary filter angles to 0 (zero offset will be applied)
+        self._cf_angle_x = 0.0
+        self._cf_angle_y = 0.0
         self._prev_timestamp_us = None

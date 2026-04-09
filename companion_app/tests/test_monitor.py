@@ -50,6 +50,7 @@ class TestAutoDiscovery:
 
         with patch("serial.tools.list_ports.comports", return_value=[mock_port]):
             from stasys.transport.serial_transport import SerialTransport
+            # No ESP32SPP/OUTGOING/INCOMING in desc — single paired port, treat as Outgoing
             result = SerialTransport.find_stasys_port()
             assert result == "COM5"
 
@@ -62,8 +63,9 @@ class TestAutoDiscovery:
 
         with patch("serial.tools.list_ports.comports", return_value=[mock_port]):
             from stasys.transport.serial_transport import SerialTransport
+            # find_stasys_port() returns the Incoming port as fallback (no Outgoing exists)
             result = SerialTransport.find_stasys_port()
-            assert result is None
+            assert result == "COM3"
 
     def test_returns_first_of_multiple(self) -> None:
         port1 = MagicMock()
@@ -100,15 +102,19 @@ class TestSerialTransport:
         mock_ser.is_open = True
 
         with patch("serial.Serial", return_value=mock_ser):
-            from stasys.transport.serial_transport import SerialTransport
-            t = SerialTransport(port="COM5")
-            with patch.object(
-                SerialTransport, "_wait_for_data", return_value=True,
+            with patch(
+                "serial.tools.list_ports.comports",
+                return_value=[MagicMock(device="COM5", hwid="BTHENUM\\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&0002", description="STASYS 'ESP32SPP' (COM5)")],
             ):
-                success, reason = t.connect()
-                assert success is True
-                assert reason is None
-                assert t.is_connected
+                from stasys.transport.serial_transport import SerialTransport
+                t = SerialTransport(port="COM5")
+                with patch.object(
+                    SerialTransport, "_wait_for_data", return_value=True,
+                ):
+                    success, reason = t.connect()
+                    assert success is True
+                    assert reason is None
+                    assert t.is_connected
 
     def test_write_when_disconnected_returns_minus_one(self) -> None:
         from stasys.transport.serial_transport import SerialTransport

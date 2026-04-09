@@ -156,7 +156,13 @@ class ProtocolParser:
                 self._force_reset(f"too many discards ({self._consecutive_discards} bytes, no sync found)")
             elif discarded > 0:
                 self._log_hex(f"No sync found, discarding {discarded} bytes", bytes(self._buf[:min(discarded, 16)]))
-            self._buf.clear()
+            # Preserve the last byte — if it's 0xAA (first sync byte), the next
+            # chunk likely contains 0x55 and the frame starts in the next feed().
+            if self._buf:
+                last = bytes(self._buf[-1:])
+                self._buf.clear()
+                if last == b"\xAA":
+                    self._buf.extend(last)
             return 0
 
         if sync_pos > 0:

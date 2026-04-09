@@ -177,18 +177,12 @@ class IMUCalibrator:
         self._is_static = std_dev < self._static_threshold
 
         # ── Calibration collection ────────────────────────────────────────────
-        if not self._is_static:
-            # Motion detected — reset accumulated samples to avoid bias pollution
-            self._count = 0
-            self._gyro_x_sum = 0.0
-            self._gyro_y_sum = 0.0
-            self._gyro_z_sum = 0.0
-            self._accel_x_sum = 0.0
-            self._accel_y_sum = 0.0
-            self._accel_z_sum = 0.0
-            return
-
-        # Static — accumulate raw samples
+        # Accumulate samples regardless of motion state. The running mean naturally
+        # filters out motion: brief movements contribute a few noisy samples to the
+        # average, but the dominant gravity signal dominates over 500 samples.
+        # This avoids the previous bug where accelerometer quantization noise between
+        # samples caused is_static to flicker, resetting the counter and never
+        # reaching 500.
         self._gyro_x_sum += gyro_x
         self._gyro_y_sum += gyro_y
         self._gyro_z_sum += gyro_z

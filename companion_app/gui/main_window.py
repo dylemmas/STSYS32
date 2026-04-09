@@ -153,14 +153,25 @@ class TopBar(QWidget):
 
         # COM port input
         self._port_input = QLineEdit()
-        self._port_input.setPlaceholderText("COM5")
-        self._port_input.setMaximumWidth(100)
+        self._port_input.setPlaceholderText("Auto-detect")
+        self._port_input.setMaximumWidth(110)
         self._port_input.setStyleSheet(
             f"background: #1a1a1a; color: {FG}; border: 1px solid #444; "
             f"border-radius: 3px; padding: 5px 8px; font-family: {FONT_MONO}; "
             f"font-size: {FONT_SIZE_SM}px;"
         )
         layout.addWidget(self._port_input)
+
+        # Scan button — auto-discovers STASYS ports
+        self._scan_btn = QPushButton("🔍 Scan")
+        self._scan_btn.setMaximumWidth(55)
+        self._scan_btn.setToolTip("Scan for STASYS device and auto-fill the port field")
+        self._scan_btn.setStyleSheet(
+            f"background: #1a1a1a; color: {FG_DIM}; border: 1px solid #444; "
+            f"border-radius: 3px; padding: 5px 8px; font-family: {FONT_MONO}; "
+            f"font-size: {FONT_SIZE_SM}px;"
+        )
+        layout.addWidget(self._scan_btn)
 
         # Connect button
         self._connect_btn = QPushButton("Connect")
@@ -225,6 +236,8 @@ class TopBar(QWidget):
         self._connect_btn.setEnabled(False)
         if self._port_input:
             self._port_input.setEnabled(False)
+        if self._scan_btn:
+            self._scan_btn.setEnabled(False)
         self._disconnect_btn.setEnabled(True)
         self._rezero_btn.setEnabled(True)
         self._session_btn.setEnabled(True)
@@ -241,6 +254,8 @@ class TopBar(QWidget):
         if self._port_input:
             self._port_input.setEnabled(True)
             self._port_input.clear()
+        if self._scan_btn:
+            self._scan_btn.setEnabled(True)
         self._disconnect_btn.setEnabled(False)
         self._rezero_btn.setEnabled(False)
         self._session_btn.setEnabled(False)
@@ -313,6 +328,10 @@ class TopBar(QWidget):
                 f"font-size: {FONT_SIZE_SM}px; font-weight: bold; letter-spacing: 1px; "
                 f"text-transform: uppercase;"
             )
+
+    @property
+    def scan_button(self) -> QPushButton:
+        return self._scan_btn
 
     @property
     def port_input(self) -> QLineEdit:
@@ -437,6 +456,7 @@ class MainWindow(QMainWindow):
         tb = self._top_bar
         tb.connect_button.clicked.connect(lambda _: self._on_connect())
         tb.port_input.returnPressed.connect(lambda: self._on_connect())
+        tb.scan_button.clicked.connect(self._on_scan)
         tb.disconnect_button.clicked.connect(self._on_disconnect)
         tb.rezero_button.clicked.connect(self._on_rezero)
         tb.session_button.clicked.connect(self._on_session_toggle)
@@ -452,17 +472,56 @@ class MainWindow(QMainWindow):
 
     # ── Connection ────────────────────────────────────────────────────────────
 
+    def _on_scan(self) -> None:
+        """Scan for STASYS Bluetooth ports and populate the port field."""
+        outgoing, incoming = SerialTransport.find_stasys_ports()
+        found: list[str] = [p for p in (outgoing, incoming) if p]
+
+        if not found:
+            import serial.tools.list_ports
+            available = [p.device for p in serial.tools.list_ports.comports()]
+            available_str = ", ".join(available) if available else "none"
+            self._status_bar.set_status(
+                f"No STASYS device found. Available ports: {available_str}", "warning"
+            )
+            self._top_bar.port_input.clear()
+            return
+
+        # Prefer Outgoing; fall back to Incoming if Outgoing not found.
+        best = outgoing or incoming
+        self._top_bar.port_input.setText(best)
+
+        if len(found) == 1:
+            self._status_bar.set_status(f"Found STASYS on {best}", "success")
+        else:
+            self._status_bar.set_status(
+                f"Found STASYS — Outgoing: {outgoing}, Incoming: {incoming} (using {best})", "success"
+            )
+
     def _on_connect(self) -> None:
-        """Connect to the manually entered COM port."""
+        """Connect to STASYS. Auto-scans if no port is entered."""
         port = self._top_bar.port_input.text().strip()
         if not port:
-            self._status_bar.set_status("Please enter a COM port (e.g., COM5)", "warning")
+            # Auto-scan and auto-connect to the best available port
+            outgoing, incoming = SerialTransport.find_stasys_ports()
+            port = outgoing or incoming
+            if port:
+                self._top_bar.port_input.setText(port)
+                self._connect_to_port(port)
+            else:
+                import serial.tools.list_ports as list_ports
+                available = [p.device for p in list_ports.comports()]
+                available_str = ", ".join(available) if available else "none"
+                self._status_bar.set_status(
+                    f"No STASYS device found. Available ports: {available_str}", "warning"
+                )
             return
         self._connect_to_port(port)
 
     def _connect_to_port(self, port: str) -> None:
         self._status_bar.set_status(f"Connecting to {port}...")
         self._top_bar._connect_btn.setEnabled(False)
+        self._top_bar._scan_btn.setEnabled(False)
         self._top_bar.port_input.setEnabled(False)
         try:
             self._transport = SerialTransport(
@@ -476,6 +535,7 @@ class MainWindow(QMainWindow):
                 msg = reason or f"Cannot open {port} — is the STASYS device powered on and paired?"
                 self._status_bar.set_status(msg, "error")
                 self._top_bar._connect_btn.setEnabled(True)
+                self._top_bar._scan_btn.setEnabled(True)
                 self._top_bar.port_input.setEnabled(True)
                 return
             # FlowControl: write_callback → transport.write; read-path XON/XOFF
@@ -487,127 +547,63 @@ class MainWindow(QMainWindow):
                 f"Connection error: {e}", "error",
             )
             self._top_bar._connect_btn.setEnabled(True)
+            self._top_bar._scan_btn.setEnabled(True)
             self._top_bar.port_input.setEnabled(True)
             return
 
-        self._running = True
+        # Parser must be created BEFORE the packet reader starts — otherwise the
+        # reader thread discards packets into the void (buffered, then fed after
+        # the parser exists, but the queue.get() already consumed them).
         self._parser = ProtocolParser(packet_callback=self._on_packet)
+        self._running = True
         self._packet_thread = threading.Thread(target=self._packet_reader, daemon=True)
         self._packet_thread.start()
 
-        # Request device info — the ESP32 only responds to commands, so we
-        # must NOT wait here. Instead, start a timeout. If RSP_INFO doesn't
-        # arrive within 5s, the ESP32 is offline even though the port opened.
-        #
-        # The reader thread handles draining stale ESP32 data automatically.
-        # We simply send the command and wait for RSP_INFO (with a 5s timeout).
         self._send_raw(cmd_get_info())
         self._connection_timeout_timer = QTimer()
         self._connection_timeout_timer.setSingleShot(True)
         self._connection_timeout_timer.timeout.connect(self._on_connection_failed)
         self._connection_timeout_timer.start(5000)  # 5-second connection verification timeout
 
-    def _drain_stale_then_wait_for_live(self) -> None:
-        """Drain stale ESP32 output from the receive queue, then wait for fresh data.
-
-        ESP32 sometimes sends a partial "AA" byte before the full "55 ..." packet
-        (separate serial reads). This is stale data from the previous session and
-        must be discarded. We drain with short timeouts to let all serial buffering
-        complete, then re-inject any complete frames (starting with 0xAA 0x55)
-        so the reader can process them normally.
-        """
-        from stasys.protocol.parser import ProtocolParser
-        stale_chunks = 0
-        live_bytes = b""
-        wait_count = 0
-        max_waits = 3  # ~3 seconds max to collect live data
-
-        # Drain all currently queued stale data (from before we were ready).
-        # Use short timeouts so we don't block the GUI thread.
-        while self._running:
-            try:
-                self._transport.read_queue.get(timeout=0.05)
-                stale_chunks += 1
-            except queue.Empty:
-                break
-
-        if stale_chunks > 0:
-            self._logger.debug("Drained %d stale chunk(s) from receive queue", stale_chunks)
-
-        # Wait for the ESP32's response to CMD_GET_INFO to arrive.
-        # The SerialTransport read thread puts data in the queue; we consume it here.
-        # Bound the wait so we don't block forever if ESP32 doesn't respond.
-        while self._running and wait_count < max_waits:
-            try:
-                chunk = self._transport.read_queue.get(timeout=1.0)
-                live_bytes += chunk
-                break  # got data — done waiting
-            except queue.Empty:
-                wait_count += 1
-
-        if live_bytes:
-            # Re-inject complete 0xAA 0x55 frames so the reader processes them.
-            # Discard incomplete "AA" prefix if the frame was split.
-            idx = live_bytes.find(b"\xaa\x55")
-            if idx >= 0:
-                complete = live_bytes[idx:]
-                self._logger.debug(
-                    "Re-injecting %d bytes of stale-complete frame: %s",
-                    len(complete), complete.hex(),
-                )
-                self._transport.read_queue.put(complete)
-            else:
-                self._logger.debug(
-                    "Stale response had no complete frame, discarding %d bytes: %s",
-                    len(live_bytes), live_bytes.hex(),
-                )
-
     def _packet_reader(self) -> None:
-        """Background thread: read from transport queue and feed parser.
+        """Background thread: reads from transport queue and feeds the parser.
 
-        On startup, drains any stale bytes from a previous session that arrived
-        before the parser was ready. ESP32 sometimes sends a partial "AA" byte
-        before the full "55 81..." packet (separate serial reads). These are
-        discarded. Any complete frames (0xAA 0x55 ...) found in stale data are
-        re-injected so the reader can process them normally.
+        Reads from the SAME queue that SerialTransport._read_loop uses (the
+        transport's _receive_queue). This allows us to drain data that arrives
+        before _parser is set, preventing the transport's _read_loop from consuming
+        it and discarding it (because it sees _parser is None).
+
+        The transport's _read_loop also reads from this queue — whichever thread
+        wins the queue.get() call processes the data. Since we call queue.get()
+        first, we always drain the queue before the transport's reader can.
         """
-        # Drain stale ESP32 output that arrived before we were ready.
-        # Use a short timeout per drain iteration so we don't block indefinitely.
-        stale_chunks = 0
-        stale_complete_frames = b""
+        pending: list[bytes] = []
+
         while self._running:
             try:
-                chunk = self._transport.read_queue.get(timeout=0.05)
-                stale_chunks += 1
-                # Accumulate complete 0xAA 0x55 frames for re-injection.
-                # If the frame is split ("AA" + "55 81..."), accumulate both.
-                stale_complete_frames += chunk
-            except queue.Empty:
-                break
-
-        if stale_chunks > 0:
-            # Check if we accumulated a complete frame in the stale data.
-            idx = stale_complete_frames.find(b"\xaa\x55")
-            if idx >= 0:
-                complete = stale_complete_frames[idx:]
-                self._logger.debug(
-                    "Re-injecting %d-byte complete frame from stale drain: %s",
-                    len(complete), complete.hex(),
-                )
-                self._transport.read_queue.put(complete)
-            else:
-                self._logger.debug(
-                    "Discarded %d stale byte chunk(s) (no complete frame)", stale_chunks,
-                )
-
-        # Normal: read live data and feed the parser.
-        while self._running:
-            try:
+                # Read from the transport's queue. This is the SAME queue that
+                # SerialTransport._read_loop reads from. We drain it first so
+                # the transport's reader doesn't consume data we haven't processed yet.
                 data = self._transport.read_queue.get(timeout=0.5)
-                if self._parser:
-                    self._parser.feed(data)
+
+                if self._parser is None:
+                    # Parser not ready — buffer everything.
+                    pending.append(data)
+                    continue
+
+                # Parser is ready — flush buffered data, then feed current.
+                if pending:
+                    buffered = b"".join(pending)
+                    pending.clear()
+                    self._logger.debug(
+                        "Flushing %d buffered chunk(s) (%d bytes) to parser",
+                        len(pending), len(buffered),
+                    )
+                    self._parser.feed(buffered)
+
+                self._parser.feed(data)
             except queue.Empty:
-                continue
+                pass
             except Exception:
                 self._logger.exception("Packet reader thread crashed — restart needed")
                 break
@@ -698,6 +694,41 @@ class MainWindow(QMainWindow):
         self._tab_live.on_disconnect()
         self._tab_shot_detail.on_disconnect()
         self._tab_analysis.on_disconnect()
+
+    def _packet_reader(self) -> None:
+        """Background thread: reads from transport queue and feeds the parser.
+
+        Waits for _parser to be initialized before reading — this prevents the
+        race where packets arrive before the parser exists and would be silently
+        discarded.
+        """
+        pending: list[bytes] = []
+
+        while self._running:
+            try:
+                data = self._transport.read_queue.get(timeout=0.5)
+
+                if self._parser is None:
+                    # Parser not ready — buffer everything until it is.
+                    pending.append(data)
+                    continue
+
+                # Parser is ready — flush buffered data, then feed current.
+                if pending:
+                    buffered = b"".join(pending)
+                    pending.clear()
+                    self._logger.debug(
+                        "Flushing %d buffered chunk(s) (%d bytes) to parser",
+                        len(pending), len(buffered),
+                    )
+                    self._parser.feed(buffered)
+
+                self._parser.feed(data)
+            except queue.Empty:
+                pass
+            except Exception:
+                self._logger.exception("Packet reader thread crashed — restart needed")
+                break
 
     def _on_info(self, info: RspInfo) -> None:
         # Cancel connection verification timeout — ESP32 is confirmed connected.
