@@ -8,7 +8,7 @@
 
 **Repository**: https://github.com/dylemmas/STSYS32
 
-After every edit, commit the changes and push to GitHub:
+After every edit, Update this CLAUDE.md about the changes and commit the changes and push to GitHub :
 ```
 git add <changed files>
 git commit -m "<description>"
@@ -453,6 +453,7 @@ python tools/loopback_test.py     # Protocol round-trip test over mock serial
 - **LED**: LEDC PWM on GPIO2 with configurable brightness (0-255). Patterns: BOOTING (1Hz blink), IDLE (double-blink), CONNECTED (solid), STREAMING (sine breathing), SHOT (3x rapid flash), LOW_BATTERY (slow pulse), ERROR (SOS).
 - **Haptic**: LEDC PWM on GPIO32 (150Hz), configurable intensity. Fires on shot detection.
 - **TX flow control**: XON (0x11) sent when TX queue drops below 16 items; XOFF (0x13) sent when TX queue exceeds 48 items. Sent as raw RFCOMM bytes, not framed protocol packets.
+- **Priority TX**: Control/event packets (SESSION_STARTED, SENSOR_HEALTH, ACK, ERROR, etc.) bypass the TX queue entirely via `sendPacketImmediate()` — direct `SerialBT.write()`. Only `DATA_RAW_SAMPLE` uses the queue. This prevents the 100Hz sample stream from blocking critical command responses.
 - **RX buffer**: 1024 bytes, overflow counter tracked. On overflow, wait for drain rather than discard.
 - **Power management**: 5-minute idle timeout → light sleep (10s wake cycle) when charging. **Battery power: no sleep** — BT radio stays active at maximum TX power (+9dBm) at all times.
 - **Auth**: HMAC-SHA256 challenge/response via `CMD_AUTH`. Compile with `#define REQUIRE_AUTH 1` in bluetooth.cpp to enforce. Currently disabled for dev workflow.
