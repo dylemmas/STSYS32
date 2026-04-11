@@ -208,13 +208,11 @@ class LiveTab(QWidget):
         self._build_ui()
         self._connect_signals()
 
-        # Update timer (GUI refresh) — 30ms = ~33 fps.
-        # Plot is updated HERE on the timer tick rather than per-packet from the
-        # signal handler, decoupling data reception from rendering.
-        # Stats are updated on every tick (acceptable at 33 fps).
+        # Update timer is disabled — live tab visualization removed.
+        # Data is recorded by DataLogger in the background thread.
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_ui)
-        self._timer.start(30)  # ~33 Hz UI refresh
+        self._timer.start(30)  # ~33 Hz UI refresh (minimal — no plot updates)
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -462,8 +460,8 @@ class LiveTab(QWidget):
     # ── Signal connections ────────────────────────────────────────────────────
 
     def _connect_signals(self) -> None:
-        self._router.sample_received.connect(self._on_sample)
-        self._router.shot_received.connect(self._on_shot)
+        # Live tab visualization is disabled — samples are recorded by DataLogger
+        # in the background thread. No per-sample processing on the main thread.
         self._router.calibrating.connect(self._on_calibrating)
         self._router.calibration_progress.connect(self._on_calibration_progress)
 
@@ -677,12 +675,11 @@ class LiveTab(QWidget):
             center_y > y_hi - MARGIN
         )
         if needs_scroll:
-            # Re-center the view on the current dot, with ±PADDING deg range
+            # Re-center the view on the current dot, with ±PADDING deg range.
+            # Trail data is in absolute degree coordinates — no need to clear
+            # trace deques; pyqtgraph renders them correctly after view pan.
             self._pw.setXRange(center_x - PADDING, center_x + PADDING, padding=0)
             self._pw.setYRange(center_y - PADDING, center_y + PADDING, padding=0)
-            # After re-centering, reset trailing curves so they re-draw in the new coordinate space
-            self._trace_x.clear()
-            self._trace_y.clear()
 
         # Phase detection
         jerk_threshold = self._mw.get_settings().get("jerk_threshold", 5.0) * 9.81

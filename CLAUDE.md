@@ -434,6 +434,9 @@ companion_app/
 └── tests/                    # pytest test suite
 ```
 
+### Live Tab Visualization
+The Live tab previously rendered a real-time muzzle trace plot (`_on_sample` / `_on_shot` signal handlers) at 33 fps, but this was disabled to reduce main-thread overhead. Samples are now recorded by `DataLogger` in the background thread only — no per-packet processing on the Qt main thread. The timer still runs at 33 Hz for UI responsiveness. The trace re-centering logic in `_update_ui` was also fixed to remove unnecessary deque clearing on view pan.
+
 ### Tests
 ```
 python -m pytest tests/ -v        # Protocol, storage, transport, GUI tests
